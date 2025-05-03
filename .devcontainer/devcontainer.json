@@ -1,0 +1,9 @@
+{
+  "image": "mcr.microsoft.com/playwright/python:v1.51.0-noble",
+  // Instala Python 3.13 para tu código (ya viene en la imagen, pero así fijas versión)
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": { "version": "3.13" }
+  },
+  // Instala tus dependencias de proyecto
+  "postCreateCommand": "pip install -r requirements.txt"
+}
