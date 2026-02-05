@@ -1,0 +1,23 @@
+# Entorno virtual
+.venv/
+
+# Datos del navegador (cookies, sesion)
+browser_data/
+
+# Cache y checkpoints
+cache/
+
+# Resultados de scraping
+scrappings/
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db

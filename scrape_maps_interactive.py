@@ -20,6 +20,8 @@ import threading
 from collections import defaultdict
 import time
 import signal # Needed for graceful shutdown signal handling
+import sys
+import subprocess
 
 # Funciones auxiliares de logging
 def log_city_info(city_name, population):
@@ -763,15 +765,26 @@ async def scrape_google_maps_cell(query: str, cell_center: dict, fixed_zoom: int
     
     async with semaphore:
         try:
-            context = await browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                viewport={'width': 1920, 'height': 1080}
-            )
+            # Cargar cookies guardadas si existen (del --setup)
+            storage_state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_data", "google_maps_state.json")
+            context_kwargs = {
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                'viewport': {'width': 1920, 'height': 1080}
+            }
+            if os.path.exists(storage_state_file):
+                context_kwargs['storage_state'] = storage_state_file
+            context = await browser.new_context(**context_kwargs)
             page = await context.new_page()
             response = await page.goto(url)
             logging.info(f"[Celda] Status code: {response.status}")
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(1500)
+            await page.wait_for_load_state("domcontentloaded")
+            # Esperar a que aparezca el feed de resultados o timeout razonable
+            try:
+                await page.wait_for_selector(".m6QErb[role='feed']", timeout=10000)
+                logging.info("[Celda] Feed de resultados detectado.")
+            except Exception:
+                logging.debug("[Celda] Feed no encontrado tras 10s, continuando igualmente...")
+            await page.wait_for_timeout(2000)
             
             # Manejo de cookies
             cookie_selectors = [
@@ -1298,8 +1311,240 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
         parser.add_argument('--strategy', type=str, choices=['simple', 'grid'], help='(Opcional) Estrategia (simple/grid) para saltar pregunta.')
         parser.add_argument('--max_results', type=int, help='(Opcional) Máx resultados por celda para saltar pregunta.')
         parser.add_argument('--workers', type=int, help='(Opcional) Número de workers en paralelo.')
+        parser.add_argument('--batch', action='store_true',
+                            help='Modo batch/background: no pide input interactivo. Usa valores por defecto para lo no especificado.')
+        parser.add_argument('--setup', action='store_true',
+                            help='Configuración interactiva completa + verificación de Google Maps en navegador visible. Guarda todo para --continue.')
+        parser.add_argument('--continue-run', action='store_true', dest='continue_run',
+                            help='Relanza el scraping en segundo plano usando la configuración guardada por --setup.')
 
         args = parser.parse_args()
+
+        # --- Rutas de archivos de configuración persistente ---
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        browser_data_dir = os.path.join(script_dir, "browser_data")
+        os.makedirs(browser_data_dir, exist_ok=True)
+        storage_state_path = os.path.join(browser_data_dir, "google_maps_state.json")
+        setup_config_path = os.path.join(browser_data_dir, "setup_config.json")
+
+        # --- Modo --continue: relanzar con config guardada ---
+        if args.continue_run:
+            if not os.path.exists(setup_config_path):
+                print("ERROR: No se encontró configuración guardada. Ejecuta primero con --setup.")
+                return
+            if not os.path.exists(storage_state_path):
+                print("ERROR: No se encontraron cookies de Google Maps. Ejecuta primero con --setup.")
+                return
+
+            with open(setup_config_path, 'r', encoding='utf-8') as f:
+                saved_config = json.load(f)
+
+            print("\n--- Configuración guardada del setup ---")
+            print(f"  Usuario GeoNames:   {saved_config.get('geonames_username')}")
+            print(f"  País:               {saved_config.get('country_code')}")
+            print(f"  Región:             {saved_config.get('region_name', 'Todas')}")
+            print(f"  Búsqueda Maps:      {saved_config.get('query')}")
+            print(f"  Población mínima:   {saved_config.get('min_population', 1000):,}")
+            max_pop = saved_config.get('max_population')
+            print(f"  Población máxima:   {f'{max_pop:,}' if max_pop else 'Sin límite'}")
+            print(f"  Estrategia:         {saved_config.get('strategy', 'simple')}")
+            print(f"  Máx. resultados:    {saved_config.get('max_results', 50)}")
+            print(f"  Workers:            {saved_config.get('workers', 1)}")
+            print("-" * 40)
+
+            # Construir comando para lanzar en background
+            cmd_parts = [
+                sys.executable, os.path.abspath(__file__),
+                '--batch',
+                '--geonames_username', saved_config['geonames_username'],
+                '--country_code', saved_config['country_code'],
+                '--query', saved_config['query'],
+                '--min_population', str(saved_config.get('min_population', 1000)),
+                '--strategy', saved_config.get('strategy', 'simple'),
+                '--max_results', str(saved_config.get('max_results', 50)),
+                '--workers', str(saved_config.get('workers', 1)),
+            ]
+            if saved_config.get('region_code'):
+                cmd_parts.extend(['--region_code', saved_config['region_code']])
+            if saved_config.get('adm2_code'):
+                cmd_parts.extend(['--adm2_code', saved_config['adm2_code']])
+            if saved_config.get('max_population') is not None:
+                cmd_parts.extend(['--max_population', str(saved_config['max_population'])])
+
+            log_file = os.path.join(script_dir, "scrapping_background.log")
+            print(f"\nLanzando scraping en segundo plano...")
+            print(f"Log: {log_file}")
+            print(f"Para ver progreso: tail -f {log_file}")
+
+            with open(log_file, 'w') as lf:
+                proc = subprocess.Popen(
+                    cmd_parts,
+                    stdout=lf, stderr=subprocess.STDOUT,
+                    start_new_session=True
+                )
+            print(f"Proceso lanzado con PID: {proc.pid}")
+            print("Puedes cerrar esta terminal. El scraping continuará en segundo plano.")
+            return
+
+        # --- Modo Setup: configuración interactiva + verificación Google Maps ---
+        if args.setup:
+            print("\n=== SETUP INICIAL ===")
+            print("Configurarás los parámetros de búsqueda y luego se abrirá")
+            print("Google Maps para que aceptes cookies/verificaciones.\n")
+
+            setup_config = {}
+            setup_config['geonames_username'] = os.environ.get('GEONAMES_USERNAME', 'gorkota')
+
+            # 1. GeoNames Username
+            username_input = input(f"Usuario de GeoNames (Enter para '{setup_config['geonames_username']}'): ").strip()
+            if username_input:
+                setup_config['geonames_username'] = username_input
+
+            # 2. Country Code
+            while not setup_config.get('country_code'):
+                code = input("Código de país (2 letras, ej: ES, GB): ").strip().upper()
+                if len(code) == 2 and code.isalpha():
+                    setup_config['country_code'] = code
+                else:
+                    print("Código de país inválido. Deben ser 2 letras.")
+
+            # 3. Region (ADM1) - opcional
+            filter_adm1 = input("¿Filtrar por Región/Estado? (s/N): ").strip().lower()
+            if filter_adm1 == 's':
+                regions = await get_regions_for_country(setup_config['country_code'], setup_config['geonames_username'])
+                if regions:
+                    print(f"\nRegiones disponibles:")
+                    for i, r in enumerate(regions):
+                        print(f"  {i+1}. {r['name']} ({r.get('code', 'N/A')})")
+                    while True:
+                        choice = input("Selecciona número o nombre (Enter para todas): ").strip()
+                        if not choice:
+                            break
+                        items_by_num = {str(i+1): r for i, r in enumerate(regions)}
+                        items_by_name = {r['name'].lower(): r for r in regions}
+                        chosen = items_by_num.get(choice) or items_by_name.get(choice.lower())
+                        if chosen and chosen.get('code'):
+                            setup_config['region_code'] = chosen['code']
+                            setup_config['region_name'] = chosen['name']
+                            print(f"Seleccionado: {chosen['name']} ({chosen['code']})")
+
+                            # 3b. ADM2 - opcional
+                            filter_adm2 = input(f"¿Filtrar por Provincia dentro de '{chosen['name']}'? (s/N): ").strip().lower()
+                            if filter_adm2 == 's':
+                                subdivisions = await get_admin_level_2_divisions(setup_config['country_code'], chosen['code'], setup_config['geonames_username'])
+                                if subdivisions:
+                                    print(f"\nProvincias disponibles:")
+                                    for i, s in enumerate(subdivisions):
+                                        print(f"  {i+1}. {s['name']} ({s.get('code', 'N/A')})")
+                                    while True:
+                                        choice2 = input("Selecciona número o nombre (Enter para todas): ").strip()
+                                        if not choice2:
+                                            break
+                                        items2_by_num = {str(i+1): s for i, s in enumerate(subdivisions)}
+                                        items2_by_name = {s['name'].lower(): s for s in subdivisions}
+                                        chosen2 = items2_by_num.get(choice2) or items2_by_name.get(choice2.lower())
+                                        if chosen2 and chosen2.get('code'):
+                                            setup_config['adm2_code'] = chosen2['code']
+                                            setup_config['adm2_name'] = chosen2['name']
+                                            print(f"Seleccionado: {chosen2['name']} ({chosen2['code']})")
+                                            break
+                                        print("Selección inválida.")
+                            break
+                        print("Selección inválida.")
+
+            # 4. Query
+            while not setup_config.get('query'):
+                query_term = input("¿Qué buscar en Google Maps? (ej: restaurantes, hoteles): ").strip()
+                if query_term:
+                    setup_config['query'] = query_term
+                else:
+                    print("El término de búsqueda es obligatorio.")
+
+            # 5. Población mínima
+            default_min = 1000
+            pop_input = input(f"Población mínima (Enter para {default_min:,}): ").strip()
+            setup_config['min_population'] = int(pop_input) if pop_input.isdigit() else default_min
+
+            # 6. Población máxima
+            pop_max_input = input("Población máxima (Enter para sin límite): ").strip()
+            setup_config['max_population'] = int(pop_max_input) if pop_max_input.isdigit() else None
+
+            # 7. Estrategia
+            strat_input = input("Estrategia [simple/grid] (Enter para 'simple'): ").strip().lower()
+            setup_config['strategy'] = strat_input if strat_input in ['simple', 'grid'] else 'simple'
+
+            # 8. Max resultados
+            max_res_input = input("Máx. resultados por celda (Enter para 50): ").strip()
+            setup_config['max_results'] = int(max_res_input) if max_res_input.isdigit() and int(max_res_input) > 0 else 50
+
+            # 9. Workers
+            workers_input = input("Workers concurrentes (Enter para 1): ").strip()
+            setup_config['workers'] = int(workers_input) if workers_input.isdigit() and int(workers_input) > 0 else 1
+
+            # --- Resumen ---
+            print("\n--- Resumen de Configuración ---")
+            print(f"  Usuario GeoNames:   {setup_config['geonames_username']}")
+            print(f"  País:               {setup_config['country_code']}")
+            print(f"  Región:             {setup_config.get('region_name', 'Todas')}")
+            if setup_config.get('adm2_name'):
+                print(f"  Provincia:          {setup_config['adm2_name']}")
+            print(f"  Búsqueda Maps:      {setup_config['query']}")
+            print(f"  Población mínima:   {setup_config['min_population']:,}")
+            max_pop = setup_config.get('max_population')
+            print(f"  Población máxima:   {f'{max_pop:,}' if max_pop else 'Sin límite'}")
+            print(f"  Estrategia:         {setup_config['strategy']}")
+            print(f"  Máx. resultados:    {setup_config['max_results']}")
+            print(f"  Workers:            {setup_config['workers']}")
+            print("-" * 40)
+
+            confirm = input("\n¿Guardar esta configuración y abrir Google Maps? (S/n): ").strip().lower()
+            if confirm not in ('s', ''):
+                print("Setup cancelado.")
+                return
+
+            # Guardar configuración
+            with open(setup_config_path, 'w', encoding='utf-8') as f:
+                json.dump(setup_config, f, ensure_ascii=False, indent=2)
+            print(f"\nConfiguración guardada en: {setup_config_path}")
+
+            # Abrir navegador visible para verificación
+            print("\nAbriendo Google Maps en navegador visible...")
+            print("  1. Acepta las cookies/consentimiento de Google")
+            print("  2. Verifica que ves resultados en el mapa")
+            print("  3. Cierra el navegador cuando termines\n")
+
+            async with async_playwright() as p_setup:
+                setup_browser = await p_setup.chromium.launch(headless=False, args=['--lang=es-ES'])
+                setup_context = await setup_browser.new_context(
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                    viewport={'width': 1920, 'height': 1080}
+                )
+                setup_page = await setup_context.new_page()
+                # Navegar con la query real del usuario
+                test_query = setup_config['query'].replace(' ', '+')
+                await setup_page.goto(f"https://www.google.com/maps/search/{test_query}/@40.4165,-3.70256,12z")
+
+                try:
+                    await setup_page.wait_for_event("close", timeout=300000)
+                except Exception:
+                    pass
+
+                try:
+                    await setup_context.storage_state(path=storage_state_path)
+                    print(f"\nCookies guardadas correctamente.")
+                except Exception:
+                    print("\nAVISO: No se pudieron guardar las cookies.")
+
+                await setup_context.close()
+                await setup_browser.close()
+
+            print("\n" + "=" * 50)
+            print("SETUP COMPLETADO")
+            print("=" * 50)
+            print(f"\nPara lanzar el scraping en segundo plano, ejecuta:")
+            print(f"  python {os.path.basename(__file__)} --continue-run")
+            print(f"\nEl proceso correrá sin necesitar terminal ni intervención.")
+            return
 
         # ---- Resume Logic ----
         processed_cities = set()
@@ -1460,7 +1705,11 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
 
             # --- ADM1 Selection --- (Only if not provided by args)
             if selected_adm1_code is None:
-                filter_adm1 = input("¿Deseas filtrar por Región/Estado (Nivel 1)? (s/N): ").strip().lower()
+                if args.batch:
+                    filter_adm1 = 'n'
+                    print("(Batch) Sin filtro de Región/Estado.")
+                else:
+                    filter_adm1 = input("¿Deseas filtrar por Región/Estado (Nivel 1)? (s/N): ").strip().lower()
                 if filter_adm1 == 's':
                     regions = await get_regions_for_country(config['country_code'], config['geonames_username'])
                     selected_adm1_code, selected_adm1_name = select_from_list(regions, "Región/Estado (Nivel 1)")
@@ -1480,7 +1729,11 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
 
             # --- ADM2 Selection --- (Only if ADM1 is selected and ADM2 not provided by args)
             if selected_adm1_code and selected_adm2_code is None:
-                filter_adm2 = input(f"¿Deseas filtrar por Provincia/Condado (Nivel 2) dentro de '{selected_adm1_name}'? (s/N): ").strip().lower()
+                if args.batch:
+                    filter_adm2 = 'n'
+                    print("(Batch) Sin filtro de Provincia/Condado.")
+                else:
+                    filter_adm2 = input(f"¿Deseas filtrar por Provincia/Condado (Nivel 2) dentro de '{selected_adm1_name}'? (s/N): ").strip().lower()
                 if filter_adm2 == 's':
                     subdivisions = await get_admin_level_2_divisions(config['country_code'], selected_adm1_code, config['geonames_username'])
                     selected_adm2_code, selected_adm2_name = select_from_list(subdivisions, "Provincia/Condado (Nivel 2)")
@@ -1526,6 +1779,9 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
 
             # 6. Maximum Population (Optional)
             if 'max_population' not in config:
+                if args.batch:
+                    config['max_population'] = None
+                    print("(Batch) Población máxima: sin límite.")
                 while 'max_population' not in config:
                     pop_input = input("Población máxima de las ciudades (Enter para 'sin límite'): ").strip()
                     if not pop_input:
@@ -1620,7 +1876,11 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
             print(f"Retomar:          No")
             print("-" * 30)
 
-            confirm = input("¿Iniciar búsqueda con esta configuración? (S/n): ").strip().lower()
+            if args.batch:
+                confirm = 's'
+                print("(Batch) Auto-confirmando inicio de búsqueda.")
+            else:
+                confirm = input("¿Iniciar búsqueda con esta configuración? (S/n): ").strip().lower()
             if confirm != 's' and confirm != '' :
                 print("Búsqueda cancelada.")
                 return
@@ -1652,7 +1912,11 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
             print(f"  - {final_csv}")
             print(f"  - {no_emails_csv}")
             print("-" * 30)
-            confirm = input("¿Continuar con esta búsqueda? (S/n): ").strip().lower()
+            if args.batch:
+                confirm = 's'
+                print("(Batch) Auto-confirmando continuación de búsqueda.")
+            else:
+                confirm = input("¿Continuar con esta búsqueda? (S/n): ").strip().lower()
             if confirm != 's' and confirm != '' :
                 print("Búsqueda cancelada.")
                 return
