@@ -22,6 +22,7 @@ import time
 import signal # Needed for graceful shutdown signal handling
 import sys
 import subprocess
+import uuid
 
 # Importar el sistema de gestión de jobs
 from job_manager import (
@@ -1258,12 +1259,28 @@ async def process_city(city_data: dict, config: dict, browser, semaphore, proces
         async with asyncio.Lock():
             processed_cities.add(city_name)
             try:
+                # Obtener stats actuales para guardarlas en el checkpoint
+                accumulated_stats = None
+                if stats_thread:
+                    current_stats = stats_thread.get_stats()
+                    accumulated_stats = {
+                        'runtime_seconds': current_stats.runtime_seconds,
+                        'results_total': current_stats.results_total,
+                        'results_with_email': current_stats.results_with_email,
+                        'results_with_corporate_email': current_stats.results_with_corporate_email,
+                        'results_with_web': current_stats.results_with_web,
+                        'errors_count': current_stats.errors_count,
+                        'avg_city_duration': current_stats.avg_city_duration,
+                    }
+
                 checkpoint_data = {
+                    'run_id': config.get('run_id'),
                     'processed_cities': list(processed_cities),
                     'last_update': datetime.now().isoformat(),
                     'final_csv': final_csv,
                     'no_emails_csv': no_emails_csv,
-                    'config': config
+                    'config': config,
+                    'accumulated_stats': accumulated_stats
                 }
                 with open(checkpoint_file, 'w', encoding='utf-8') as f:
                     json.dump(checkpoint_data, f, indent=4)
@@ -1342,6 +1359,8 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                             help='Configuración interactiva completa + verificación de Google Maps en navegador visible. Guarda todo para --continue.')
         parser.add_argument('--continue-run', action='store_true', dest='continue_run',
                             help='Relanza el scraping en segundo plano usando la configuración guardada por --setup.')
+        parser.add_argument('--run-id', type=str, dest='run_id',
+                            help='ID de ejecución específico para retomar con --resume. Si no se especifica, retoma el más reciente.')
 
         args = parser.parse_args()
 
@@ -1608,31 +1627,71 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
         checkpoint_file = None # Initialize
         cache_file = None # Initialize
         resuming = False # Flag to track if resume was successful
+        current_run_id = None  # Track the run_id for this execution
+        base_stats = None  # Stats acumuladas de ejecuciones anteriores (para resume)
 
         if args.resume:
-            print("Intentando retomar desde el último checkpoint...")
-            # Find the latest checkpoint file in the cache directory
             cache_dir = "cache"
             os.makedirs(cache_dir, exist_ok=True)
-            checkpoints = sorted(
-                [os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.startswith('checkpoint_') and f.endswith('.json')],
-                key=os.path.getmtime,
-                reverse=True
-            )
-            
-            if checkpoints:
-                checkpoint_file = checkpoints[0]
+
+            # If a specific run_id is provided, look for that checkpoint
+            if args.run_id:
+                print(f"Buscando checkpoint para run_id: {args.run_id}...")
+                checkpoint_file = os.path.join(cache_dir, f"checkpoint_{args.run_id}.json")
+                if not os.path.exists(checkpoint_file):
+                    print(f"No se encontró checkpoint para run_id '{args.run_id}'.")
+                    # List available checkpoints
+                    available = [f for f in os.listdir(cache_dir) if f.startswith('checkpoint_') and f.endswith('.json')]
+                    if available:
+                        print("\nCheckpoints disponibles:")
+                        for cp in sorted(available, key=lambda x: os.path.getmtime(os.path.join(cache_dir, x)), reverse=True)[:10]:
+                            run_id_match = re.match(r"checkpoint_(.*)\.json", cp)
+                            if run_id_match:
+                                cp_path = os.path.join(cache_dir, cp)
+                                try:
+                                    with open(cp_path, 'r') as f:
+                                        cp_data = json.load(f)
+                                    cp_config = cp_data.get('config', {})
+                                    print(f"  - {run_id_match.group(1)}: {cp_config.get('query', '?')} en {cp_config.get('country_code', '?')}")
+                                except:
+                                    print(f"  - {run_id_match.group(1)}: (error leyendo)")
+                    args.resume = False
+                    checkpoint_file = None
+            else:
+                print("Intentando retomar desde el último checkpoint...")
+                # Find the latest checkpoint file in the cache directory
+                checkpoints = sorted(
+                    [os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.startswith('checkpoint_') and f.endswith('.json')],
+                    key=os.path.getmtime,
+                    reverse=True
+                )
+                if checkpoints:
+                    checkpoint_file = checkpoints[0]
+                else:
+                    print("No se encontraron archivos de checkpoint. Iniciando una nueva configuración.")
+                    args.resume = False
+
+            if checkpoint_file and os.path.exists(checkpoint_file):
                 try:
                     logging.info(f"Cargando checkpoint desde: {checkpoint_file}")
                     with open(checkpoint_file, 'r', encoding='utf-8') as f:
                         checkpoint_data = json.load(f)
-                    
+
+                    # Extract run_id from checkpoint filename or data
+                    run_id_match = re.match(r"checkpoint_(.*)\.json", os.path.basename(checkpoint_file))
+                    if run_id_match:
+                        current_run_id = run_id_match.group(1)
+                    else:
+                        current_run_id = checkpoint_data.get('run_id')
+
+                    logging.info(f"Run ID: {current_run_id}")
+
                     # Load config from checkpoint FIRST
                     if 'config' in checkpoint_data:
                         config = checkpoint_data['config']
                         logging.info("Configuración cargada desde checkpoint.")
                         # Ensure resume flag is set in the loaded config
-                        config['resume'] = True 
+                        config['resume'] = True
                         # Make sure essential keys exist
                         config.setdefault('workers', DEFAULT_WORKERS)
                     else:
@@ -1641,24 +1700,40 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                     processed_cities = set(checkpoint_data.get('processed_cities', []))
                     final_csv = checkpoint_data.get('final_csv')
                     no_emails_csv = checkpoint_data.get('no_emails_csv')
-                    
+
+                    # Cargar stats acumuladas del checkpoint (si existen)
+                    accumulated_stats_data = checkpoint_data.get('accumulated_stats')
+                    if accumulated_stats_data:
+                        base_stats = JobStats(
+                            runtime_seconds=accumulated_stats_data.get('runtime_seconds', 0),
+                            results_total=accumulated_stats_data.get('results_total', 0),
+                            results_with_email=accumulated_stats_data.get('results_with_email', 0),
+                            results_with_corporate_email=accumulated_stats_data.get('results_with_corporate_email', 0),
+                            results_with_web=accumulated_stats_data.get('results_with_web', 0),
+                            errors_count=accumulated_stats_data.get('errors_count', 0),
+                            avg_city_duration=accumulated_stats_data.get('avg_city_duration', 0),
+                            cities_total=0,  # Se actualizará después
+                            cities_processed=len(processed_cities),
+                        )
+                        logging.info(f"  - Stats acumuladas: {format_duration(base_stats.runtime_seconds)} runtime, {base_stats.results_total} resultados")
+                    else:
+                        base_stats = None
+                        logging.info("  - Sin stats acumuladas previas (checkpoint antiguo)")
+
                     # Ensure file paths are valid
                     if not final_csv or not no_emails_csv:
                         raise ValueError("Nombres de archivo CSV no encontrados en el checkpoint.")
-                    
-                    # Derive cache file name from checkpoint name
-                    base_filename_match = re.match(r"checkpoint_(.*)\.json", os.path.basename(checkpoint_file))
-                    if not base_filename_match:
-                         raise ValueError("No se pudo extraer el nombre base del archivo de checkpoint.")
-                    base_filename = base_filename_match.group(1)
-                    cache_file = os.path.join(cache_dir, f"processed_businesses_{base_filename}.json")
+
+                    # Cache file uses the same run_id
+                    cache_file = os.path.join(cache_dir, f"processed_businesses_{current_run_id}.json")
 
                     logging.info(f"Retomando ejecución con la configuración del checkpoint.")
+                    logging.info(f"  - Run ID: {current_run_id}")
                     logging.info(f"  - {len(processed_cities)} ciudades ya procesadas.")
                     logging.info(f"  - Archivo con correos: {final_csv}")
                     logging.info(f"  - Archivo sin correos: {no_emails_csv}")
                     logging.info(f"  - Archivo caché: {cache_file}")
-                    
+
                     # Load processed businesses cache associated with this checkpoint
                     if os.path.exists(cache_file):
                         try:
@@ -1672,7 +1747,7 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                             temp_processed_businesses = set()
                     else:
                         logging.warning(f"No se encontró archivo de caché {cache_file} asociado al checkpoint.")
-                    
+
                     resuming = True # Set resume flag to true
 
                 except Exception as e:
@@ -1680,9 +1755,6 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                     config = {} # Reset config if resume fails badly
                     args.resume = False # Disable resume for interactive part
                     print("No se pudo retomar la sesión. Iniciando una nueva configuración.")
-            else:
-                print("No se encontraron archivos de checkpoint. Iniciando una nueva configuración.")
-                args.resume = False # Disable resume for interactive part
 
         # ---- Interactive Configuration (Only if not resuming successfully) ----
         if not resuming: 
@@ -2003,38 +2075,38 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
 
         # Generate dynamic filenames based on final config (Only if not resuming)
         if not resuming:
-            # --- Generate Base Filename --- #
-            country_part = config['country_code']
-            region_part = f"adm1_{config['region_code']}" if config.get('region_code') else "adm1_all"
-            adm2_part = f"adm2_{config['adm2_code']}" if config.get('adm2_code') else "adm2_all"
-            query_file_part = config['query'].replace(' ', '_').lower()
-            pop_part = f"pop{config['min_population']}"
-            if config.get('max_population') is not None:
-                 pop_part += f"to{config['max_population']}"
-            else:
-                 pop_part += "plus"
-            strat_part = f"strat{config['strategy']}"
-            max_res_part = f"max{config['max_results']}"
+            # --- Check for conflicting active runs with same config --- #
+            job_manager_check = JobManager()
+            active_instances = job_manager_check.list_instances()
+            for inst in active_instances:
+                inst_config = inst.config
+                # Check if there's an active instance with the same key parameters
+                if (inst_config.get('country_code') == config.get('country_code') and
+                    inst_config.get('query') == config.get('query') and
+                    inst_config.get('min_population') == config.get('min_population') and
+                    inst_config.get('region_code') == config.get('region_code')):
+                    logging.error(f"¡Ya existe un proceso activo con la misma configuración!")
+                    logging.error(f"  PID: {inst.pid}, Run ID: {inst_config.get('run_id')}")
+                    logging.error(f"  Query: {inst_config.get('query')} en {inst_config.get('country_code')}")
+                    logging.error("Use 'scrape_manager.py' para gestionar el proceso existente o espere a que termine.")
+                    return
 
-            base_filename_parts = [
-                country_part,
-                region_part,
-                adm2_part,
-                query_file_part,
-                pop_part,
-                strat_part,
-                max_res_part
-            ]
-            base_filename = "_".join(filter(None, base_filename_parts)) # Filter None in case some parts are empty
+            # --- Generate unique run_id --- #
+            current_run_id = str(uuid.uuid4())[:8]  # Short UUID for readability
+            logging.info(f"Nuevo Run ID generado: {current_run_id}")
 
-            # Ensure required config keys exist before generating filename (redundant check maybe)
+            # Ensure required config keys exist
             required_keys = ['country_code', 'query', 'min_population', 'max_results', 'strategy']
             if not all(k in config for k in required_keys):
                  logging.error("Error crítico: Faltan claves de configuración para generar nombres de archivo.")
                  return
 
-            cache_file = os.path.join(cache_dir, f"processed_businesses_{base_filename}.json")
-            checkpoint_file = os.path.join(cache_dir, f"checkpoint_{base_filename}.json")
+            # Store run_id in config for reference
+            config['run_id'] = current_run_id
+
+            # Use run_id for checkpoint and cache files (unique per execution)
+            cache_file = os.path.join(cache_dir, f"processed_businesses_{current_run_id}.json")
+            checkpoint_file = os.path.join(cache_dir, f"checkpoint_{current_run_id}.json")
             logging.info(f"Usando archivo de caché: {cache_file}")
             logging.info(f"Usando archivo de checkpoint: {checkpoint_file}")
 
@@ -2043,26 +2115,18 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
             processed_cities = set()
             processed_businesses = set()
             temp_processed_businesses = set()
-            
-            # Delete existing cache/checkpoint for this exact config if they exist
-            if os.path.exists(cache_file):
-                 try: 
-                     os.remove(cache_file)
-                     logging.info(f"Caché anterior eliminado: {cache_file}")
-                 except OSError as e: logging.error(f"Error eliminando caché anterior: {e}")
-            if os.path.exists(checkpoint_file):
-                 try: 
-                     os.remove(checkpoint_file)
-                     logging.info(f"Checkpoint anterior eliminado: {checkpoint_file}")
-                 except OSError as e: logging.error(f"Error eliminando checkpoint anterior: {e}")
 
-            # Create new result filenames with timestamp
+            # Generate descriptive filename for results (includes config info for easy identification)
+            country_part = config['country_code']
+            query_file_part = config['query'].replace(' ', '_').lower()[:20]
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
             scrappings_dir = "scrappings"
             os.makedirs(scrappings_dir, exist_ok=True)
-            # Use same base_filename for results
-            final_csv = os.path.join(scrappings_dir, f"results_{base_filename}_{timestamp}.csv")
-            no_emails_csv = os.path.join(scrappings_dir, f"no_emails_{base_filename}_{timestamp}.csv")
+
+            # Results files include both descriptive name and run_id for traceability
+            final_csv = os.path.join(scrappings_dir, f"results_{country_part}_{query_file_part}_{current_run_id}_{timestamp}.csv")
+            no_emails_csv = os.path.join(scrappings_dir, f"no_emails_{country_part}_{query_file_part}_{current_run_id}_{timestamp}.csv")
             logging.info(f"Creando nuevos archivos de resultados:")
             logging.info(f"  - Con correos: {final_csv}")
             logging.info(f"  - Sin correos: {no_emails_csv}")
@@ -2140,7 +2204,7 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
             control_thread.start()
             logging.debug("ControlThread iniciado")
 
-            stats_thread = StatsThread(pid, current_job, job_manager, update_interval=5.0)
+            stats_thread = StatsThread(pid, current_job, job_manager, update_interval=5.0, base_stats=base_stats)
             stats_thread.stats.cities_total = len(cities)
             stats_thread.stats.cities_processed = len(processed_cities)
             stats_thread.start()
@@ -2314,6 +2378,9 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                 return_when=asyncio.FIRST_COMPLETED
             )
 
+            # Track if queue completed normally (before shutdown was triggered)
+            queue_completed_normally = False
+
             if shutdown_wait_task in done:
                 logging.info("Señal de parada recibida, cancelando tareas pendientes...")
                 # Cancel the queue monitor if it's still pending
@@ -2322,6 +2389,7 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                 # Proceed to cancel workers (which should happen shortly anyway)
             else:
                 logging.info("Todas las ciudades de la cola han sido procesadas.")
+                queue_completed_normally = True  # Mark as completed normally
                 # Cancel the shutdown monitor as it's no longer needed
                 if shutdown_wait_task in pending:
                     shutdown_wait_task.cancel()
@@ -2371,16 +2439,33 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
              try:
                  # processed_cities should now be accurate as workers finished cleanly
                  logging.info(f"Guardando checkpoint en {checkpoint_file}... ({len(processed_cities)} ciudades completadas)")
+
+                 # Obtener stats actuales para guardarlas
+                 accumulated_stats = None
+                 if 'stats_thread' in locals() and stats_thread:
+                     current_stats = stats_thread.get_stats()
+                     accumulated_stats = {
+                         'runtime_seconds': current_stats.runtime_seconds,
+                         'results_total': current_stats.results_total,
+                         'results_with_email': current_stats.results_with_email,
+                         'results_with_corporate_email': current_stats.results_with_corporate_email,
+                         'results_with_web': current_stats.results_with_web,
+                         'errors_count': current_stats.errors_count,
+                         'avg_city_duration': current_stats.avg_city_duration,
+                     }
+
                  with open(checkpoint_file, 'w', encoding='utf-8') as f:
                      checkpoint_data = {
+                         'run_id': config.get('run_id'),
                          'processed_cities': sorted(list(processed_cities)), # Save sorted list
                          'last_update': datetime.now().isoformat(),
                          'final_csv': final_csv,
                          'no_emails_csv': no_emails_csv,
-                         'config': config # Save the config used
+                         'config': config, # Save the config used
+                         'accumulated_stats': accumulated_stats
                      }
                      json.dump(checkpoint_data, f, indent=4)
-                 logging.info(f"Checkpoint guardado. El proceso se puede retomar usando --resume")
+                 logging.info(f"Checkpoint guardado. El proceso se puede retomar usando --resume --run-id {config.get('run_id')}")
              except Exception as e:
                  logging.error(f"Error guardando checkpoint: {e}")
         else:
@@ -2430,7 +2515,8 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
 
         # Determine final job status and update
         final_status = JobStatus.INTERRUPTED
-        if not shutdown_event.is_set() and 'cities_queue' in locals() and cities_queue.empty():
+        # Check if queue completed normally (set before shutdown_event was triggered for worker cleanup)
+        if 'queue_completed_normally' in locals() and queue_completed_normally:
             final_status = JobStatus.COMPLETED
             logging.info("Proceso completado normalmente.")
             # Completed successfully, remove checkpoint if it exists

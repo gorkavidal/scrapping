@@ -181,10 +181,14 @@ nohup .venv/bin/python scrape_maps_interactive.py \
 ### Modo resume (retomar ejecucion interrumpida)
 
 ```bash
+# Retomar el ultimo checkpoint
 .venv/bin/python scrape_maps_interactive.py --resume
+
+# Retomar un run especifico por su ID
+.venv/bin/python scrape_maps_interactive.py --resume --run-id abc12345
 ```
 
-Carga el ultimo checkpoint y continua desde donde se quedo. Util si el proceso se interrumpio por un corte de luz, Ctrl+C, etc.
+Carga el checkpoint y continua desde donde se quedo. Cada ejecucion tiene un `run_id` unico (8 caracteres) que se muestra al iniciar y en los logs. Si no se especifica `--run-id`, retoma el checkpoint mas reciente.
 
 ## Parametros
 
@@ -196,6 +200,7 @@ Carga el ultimo checkpoint y continua desde donde se quedo. Util si el proceso s
 | `--continue-run` | Lanza el scraping en segundo plano usando la configuracion guardada por `--setup`. |
 | `--batch` | Modo no interactivo. No hace preguntas, usa valores por defecto para lo no especificado. |
 | `--resume` | Retoma la ejecucion desde el ultimo checkpoint guardado. |
+| `--run-id ID` | (Con `--resume`) Especifica el run_id exacto a retomar en lugar del mas reciente. |
 
 ### Parametros de busqueda
 
@@ -260,12 +265,21 @@ Columnas:
 | Email_Search_Status | Estado de la busqueda de email |
 | ID | Hash MD5 unico del negocio |
 
-### Checkpoints
+### Checkpoints y Run IDs
 
-Se guardan en la carpeta `cache/`:
+Cada ejecucion tiene un **run_id** unico (8 caracteres, ej: `a1b2c3d4`) que identifica de forma inequivoca esa sesion de scraping. Esto permite:
 
-- `checkpoint_*.json` - Estado de la ejecucion para poder retomar con `--resume`
-- `processed_businesses_*.json` - Cache de negocios ya procesados (evita duplicados)
+- Retomar una ejecucion especifica con `--resume --run-id abc12345`
+- Evitar conflictos si lanzas accidentalmente dos procesos con la misma configuracion
+- Trazabilidad entre archivos de resultados y checkpoints
+
+Los archivos se guardan en la carpeta `cache/`:
+
+- `checkpoint_{run_id}.json` - Estado de la ejecucion para poder retomar con `--resume`
+- `processed_businesses_{run_id}.json` - Cache de negocios ya procesados (evita duplicados)
+
+Los archivos de resultados incluyen el run_id en el nombre:
+- `results_{pais}_{query}_{run_id}_{timestamp}.csv`
 
 ### Configuracion del setup
 
@@ -347,6 +361,15 @@ El gestor tiene tres vistas principales:
 | Historico de jobs | `2` | Todos los jobs ejecutados (completados, interrumpidos, fallidos) |
 | Visor de archivos | `F` | Vista tabular del CSV de resultados de la instancia seleccionada |
 
+### Controles globales
+
+| Tecla | Accion | Descripcion |
+|-------|--------|-------------|
+| `N` | Nuevo | Abre el asistente para lanzar un nuevo scraping. |
+| `1` | Vista activas | Cambia a la vista de instancias activas. |
+| `2` | Vista historico | Cambia a la vista de historico de jobs. |
+| `Q` | Salir | Cierra el gestor (los procesos siguen corriendo). |
+
 ### Controles en vista de instancias activas
 
 | Tecla | Accion | Descripcion |
@@ -427,12 +450,39 @@ Los comandos (pause, resume, stop) se envian via archivos en `cache/control/` y 
 
 El gestor detecta automaticamente procesos muertos (zombies) y los limpia del registro de instancias activas, marcando sus jobs como `interrupted` en el historico.
 
+### Lanzar nuevo scraping (tecla N)
+
+Al pulsar `N` se abre un asistente interactivo para configurar y lanzar un nuevo scraping:
+
+1. **Verificacion de cookies**: El gestor comprueba si existen cookies validas de Google Maps (menos de 7 dias de antiguedad).
+   - Si no hay cookies validas, ofrece ejecutar `--setup` para obtenerlas.
+   - Si el usuario elige continuar sin cookies, el scraping probablemente fallara.
+
+2. **Formulario de configuracion**: Campos editables con valores por defecto:
+   - Pais (codigo de 2 letras)
+   - Termino de busqueda
+   - Poblacion minima/maxima
+   - Workers paralelos (1-10)
+   - Estrategia (simple/grid)
+   - Max resultados por celda
+
+3. **Lanzamiento**: El scraping se lanza en segundo plano con `--batch` y los logs se guardan en `scrapping_background.log`.
+
+### Estadisticas persistentes
+
+Las estadisticas de cada run (tiempo de ejecucion, resultados, etc.) se mantienen entre pausas y resumes:
+
+- Al pausar o interrumpir, las stats se guardan en el checkpoint
+- Al retomar con `--resume`, las stats anteriores se recuperan y se suman a las nuevas
+- El tiempo de ejecucion mostrado es el tiempo real acumulado de scraping activo (no incluye pausas)
+
 ## Notas importantes
 
 - **Primera ejecucion**: Siempre ejecuta `--setup` primero para aceptar cookies/verificaciones de Google Maps. Sin este paso, el scraping en modo headless no obtendra resultados.
 - **Cookies caducadas**: Si el scraping empieza a devolver 0 resultados, vuelve a ejecutar `--setup` para renovar las cookies.
 - **Rate limiting**: Google Maps puede limitar las peticiones si se hacen demasiadas en poco tiempo. Usar pocos workers (1-2) es mas seguro.
 - **Deduplicacion**: El script deduplica automaticamente por nombre+direccion+telefono y por web+telefono. No genera duplicados aunque las celdas se solapen.
-- **Interrupcion segura**: Puedes parar el proceso con `Ctrl+C` o `kill`. El checkpoint se guarda automaticamente y puedes retomar con `--resume`.
+- **Proteccion contra conflictos**: Si intentas lanzar una nueva ejecucion con la misma configuracion que un proceso activo, el script lo detecta y aborta para evitar corrupcion de datos.
+- **Interrupcion segura**: Puedes parar el proceso con `Ctrl+C` o `kill`. El checkpoint se guarda automaticamente y puedes retomar con `--resume --run-id {id}`.
 - **Gestor de instancias**: Usa `scrape_manager.py` para controlar instancias en ejecucion sin interrumpir el scraping.
 - **GeoNames API**: Necesitas una cuenta gratuita en [geonames.org](https://www.geonames.org/login) para usar la API. El usuario por defecto es `gorkota`.

@@ -20,6 +20,8 @@ import sys
 import threading
 import time
 import csv
+import asyncio
+import aiohttp
 from datetime import datetime
 from typing import List, Optional
 from collections import deque
@@ -28,6 +30,79 @@ from job_manager import (
     JobManager, Job, Instance, JobStatus, JobStats,
     ControlCommand, format_duration, calculate_eta
 )
+
+
+# ---- GeoNames API functions (simplified from scrape_maps_interactive.py) ----
+
+async def fetch_geonames_api(endpoint: str, params: dict) -> dict:
+    """Función genérica para llamar a la API de GeoNames."""
+    base_url = "http://api.geonames.org/"
+    url = f"{base_url}{endpoint}"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, params=params, timeout=30) as response:
+                response.raise_for_status()
+                content_type = response.headers.get('Content-Type', '')
+                if 'application/json' in content_type:
+                    data = await response.json()
+                else:
+                    return {"error": "Formato no JSON"}
+                if isinstance(data, dict) and 'status' in data:
+                    return {"error": data['status']['message']}
+                return data
+        except Exception as e:
+            return {"error": str(e)}
+
+
+async def get_regions_for_country(country_code: str, geonames_username: str) -> list:
+    """Obtiene las divisiones ADM1 (regiones/estados) para un país."""
+    params = {
+        'country': country_code.upper(),
+        'featureCode': 'ADM1',
+        'username': geonames_username,
+        'style': 'FULL',
+        'type': 'JSON'
+    }
+    data = await fetch_geonames_api('searchJSON', params)
+    regions = []
+    if data and 'geonames' in data:
+        regions = sorted([
+            {
+                'name': region.get('adminName1') or region.get('name'),
+                'code': region.get('adminCode1'),
+                'geonameId': region.get('geonameId')
+            }
+            for region in data['geonames']
+            if (region.get('adminName1') or region.get('name')) and region.get('adminCode1')
+        ], key=lambda x: x['name'])
+    return regions
+
+
+async def get_subdivisions_for_region(country_code: str, adm1_code: str, geonames_username: str) -> list:
+    """Obtiene las divisiones ADM2 (provincias/condados) para una región ADM1."""
+    if not adm1_code:
+        return []
+    params = {
+        'country': country_code.upper(),
+        'adminCode1': adm1_code,
+        'featureCode': 'ADM2',
+        'username': geonames_username,
+        'style': 'FULL',
+        'type': 'JSON'
+    }
+    data = await fetch_geonames_api('searchJSON', params)
+    subdivisions = []
+    if data and 'geonames' in data:
+        subdivisions = sorted([
+            {
+                'name': sub.get('adminName2') or sub.get('name'),
+                'code': sub.get('adminCode2'),
+                'geonameId': sub.get('geonameId')
+            }
+            for sub in data['geonames']
+            if (sub.get('adminName2') or sub.get('name')) and sub.get('adminCode2')
+        ], key=lambda x: x['name'])
+    return subdivisions
 
 
 class ScrapeManager:
@@ -147,12 +222,12 @@ class ScrapeManager:
         height, width = self.stdscr.getmaxyx()
 
         if self.view_mode == "active":
-            help_text = " [P]ausar [R]esumir [S]top [K]ill [W]orkers [F]iles [1]Act [2]Hist [Q]uit "
+            help_text = " [N]uevo [P]ausar [R]esumir [S]top [K]ill [W]orkers [F]iles [1]Act [2]Hist [Q]uit "
         elif self.view_mode == "history":
-            help_text = " [Enter]Revivir [D]eliminar [F]iles [1]Activas [2]Hist [Q]uit "
+            help_text = " [N]uevo [Enter]Revivir [D]eliminar [F]iles [1]Act [2]Hist [Q]uit "
         else:  # files
             email_mode = "Todos" if self.show_all_emails else "Corp"
-            help_text = f" [↑↓]Scroll [E]mails:{email_mode} [1]Activas [2]Histórico [Q]uit "
+            help_text = f" [↑↓]Scroll [E]mails:{email_mode} [N]uevo [1]Act [2]Hist [Q]uit "
 
         help_text = help_text.ljust(width - 1)[:width - 1]
 
@@ -268,9 +343,11 @@ class ScrapeManager:
 
         self.stdscr.addstr(start_y, 0, "=" * (width - 1))
 
-        # Title
+        # Title (includes run_id if available)
+        run_id = config.get('run_id', '')
+        run_id_part = f" | Run: {run_id}" if run_id else ""
         self.stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-        title = f" Detalles - PID {instance.pid} | {config.get('query', 'N/A')} en {config.get('country_code', 'N/A')} "
+        title = f" PID {instance.pid} | {config.get('query', 'N/A')} en {config.get('country_code', 'N/A')}{run_id_part} "
         self.stdscr.addstr(start_y + 1, 2, title[:width - 4])
         self.stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
 
@@ -550,6 +627,9 @@ class ScrapeManager:
             self.view_mode = "history"
             self.selected_index = 0
             return
+        if key == ord('n') or key == ord('N'):
+            self.new_scraping_wizard()
+            return
 
         # File view scrolling and commands
         if self.view_mode == "files":
@@ -758,30 +838,38 @@ class ScrapeManager:
                 self.show_message("El número de workers ya es el solicitado")
                 return
 
-            # Find and update the checkpoint file
+            # Find and update the checkpoint file using run_id
             script_dir = os.path.dirname(os.path.abspath(__file__))
             cache_dir = os.path.join(script_dir, "cache")
 
-            # Find checkpoint for this job
-            checkpoint_file = None
-            if os.path.exists(cache_dir):
-                for filename in os.listdir(cache_dir):
-                    if filename.startswith("checkpoint_") and filename.endswith(".json"):
-                        filepath = os.path.join(cache_dir, filename)
-                        try:
-                            with open(filepath, 'r', encoding='utf-8') as f:
-                                data = json.load(f)
-                            # Check if this checkpoint matches the job config
-                            if data.get('config', {}).get('query') == job.config.get('query') and \
-                               data.get('config', {}).get('country_code') == job.config.get('country_code'):
-                                checkpoint_file = filepath
-                                break
-                        except:
-                            continue
+            # Get run_id from job config
+            run_id = job.config.get('run_id')
+            if run_id:
+                checkpoint_file = os.path.join(cache_dir, f"checkpoint_{run_id}.json")
+                if not os.path.exists(checkpoint_file):
+                    self.show_message(f"No se encontró checkpoint para run_id {run_id}")
+                    return
+            else:
+                # Fallback: search by query/country for old checkpoints without run_id
+                checkpoint_file = None
+                if os.path.exists(cache_dir):
+                    for filename in os.listdir(cache_dir):
+                        if filename.startswith("checkpoint_") and filename.endswith(".json"):
+                            filepath = os.path.join(cache_dir, filename)
+                            try:
+                                with open(filepath, 'r', encoding='utf-8') as f:
+                                    data = json.load(f)
+                                # Check if this checkpoint matches the job config
+                                if data.get('config', {}).get('query') == job.config.get('query') and \
+                                   data.get('config', {}).get('country_code') == job.config.get('country_code'):
+                                    checkpoint_file = filepath
+                                    break
+                            except:
+                                continue
 
-            if not checkpoint_file:
-                self.show_message("No se encontró el checkpoint para este job")
-                return
+                if not checkpoint_file:
+                    self.show_message("No se encontró el checkpoint para este job")
+                    return
 
             # Update checkpoint with new workers
             with open(checkpoint_file, 'r', encoding='utf-8') as f:
@@ -862,10 +950,15 @@ class ScrapeManager:
                 with open(log_file, 'a') as lf:
                     lf.write(f"\n{'='*60}\n")
                     lf.write(f"Relanzando con {new_workers} workers (esperó {elapsed}s, {kill_method})\n")
+                    lf.write(f"Run ID: {run_id}\n")
                     lf.write(f"Timestamp: {datetime.now().isoformat()}\n")
                     lf.write(f"{'='*60}\n")
+                    # Use --run-id to resume the specific run
+                    cmd = [sys.executable, script_path, '--resume', '--batch']
+                    if run_id:
+                        cmd.extend(['--run-id', run_id])
                     subprocess.Popen(
-                        [sys.executable, script_path, '--resume', '--batch'],
+                        cmd,
                         stdout=lf, stderr=subprocess.STDOUT,
                         start_new_session=True
                     )
@@ -887,9 +980,13 @@ class ScrapeManager:
         """Revives an interrupted job by launching a new process.
 
         The old job entry is deleted from history to avoid duplicates.
+        Uses --run-id to resume the specific run if available.
         """
         script_dir = os.path.dirname(os.path.abspath(__file__))
         script_path = os.path.join(script_dir, "scrape_maps_interactive.py")
+
+        # Get run_id from job config
+        run_id = job.config.get('run_id')
 
         cmd_parts = [
             sys.executable, script_path,
@@ -897,12 +994,18 @@ class ScrapeManager:
             '--batch'
         ]
 
+        # Add run_id if available
+        if run_id:
+            cmd_parts.extend(['--run-id', run_id])
+
         log_file = os.path.join(script_dir, "scrapping_background.log")
 
         try:
             with open(log_file, 'a') as lf:
                 lf.write(f"\n{'='*60}\n")
                 lf.write(f"Reviviendo job: {job.job_id}\n")
+                if run_id:
+                    lf.write(f"Run ID: {run_id}\n")
                 lf.write(f"Timestamp: {datetime.now().isoformat()}\n")
                 lf.write(f"{'='*60}\n")
                 proc = subprocess.Popen(
@@ -919,6 +1022,755 @@ class ScrapeManager:
             self.show_message(f"Job revivido con PID {proc.pid}", 5.0)
         except Exception as e:
             self.show_message(f"Error reviviendo job: {e}")
+
+    def check_cookies_valid(self) -> tuple[bool, str]:
+        """Checks if Google Maps cookies exist and are recent (less than 7 days old).
+
+        Returns (is_valid, message).
+        """
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        cookies_file = os.path.join(script_dir, "browser_data", "google_maps_state.json")
+
+        if not os.path.exists(cookies_file):
+            return False, "No hay cookies guardadas"
+
+        try:
+            # Check file age
+            file_mtime = os.path.getmtime(cookies_file)
+            age_days = (time.time() - file_mtime) / (24 * 3600)
+
+            if age_days > 7:
+                return False, f"Cookies antiguas ({int(age_days)} días)"
+
+            # Check file is valid JSON and has content
+            with open(cookies_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if not data:
+                    return False, "Archivo de cookies vacío"
+
+            return True, f"Cookies válidas ({int(age_days)} días)"
+        except Exception as e:
+            return False, f"Error leyendo cookies: {e}"
+
+    def run_setup_mode(self):
+        """Runs the scraper in --setup mode to get fresh cookies.
+
+        This opens a visible browser for the user to complete verification.
+        """
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_path = os.path.join(script_dir, "scrape_maps_interactive.py")
+
+        # Temporarily exit curses to run setup interactively
+        curses.endwin()
+
+        print("\n" + "=" * 60)
+        print("MODO SETUP - Configuración de cookies")
+        print("=" * 60)
+        print("\nSe abrirá un navegador visible para verificar Google Maps.")
+        print("Completa cualquier verificación/captcha que aparezca.")
+        print("Cuando termines, cierra el navegador o pulsa Ctrl+C.\n")
+
+        try:
+            subprocess.run([sys.executable, script_path, '--setup'], check=False)
+        except KeyboardInterrupt:
+            pass
+
+        print("\nVolviendo al gestor...")
+        time.sleep(1)
+
+        # Reinitialize curses
+        self.stdscr = curses.initscr()
+        curses.noecho()
+        curses.cbreak()
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        self.stdscr.keypad(True)
+        self.stdscr.timeout(100)
+
+    def new_scraping_wizard(self):
+        """Interactive wizard to create and launch a new scraping job."""
+        height, width = self.stdscr.getmaxyx()
+
+        # Check cookies first
+        cookies_valid, cookies_msg = self.check_cookies_valid()
+
+        if not cookies_valid:
+            # Show warning and ask if user wants to run setup
+            self.stdscr.clear()
+            self.draw_header()
+
+            y = 4
+            self.stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
+            self.stdscr.addstr(y, 2, " ⚠ AVISO: Cookies no válidas ")
+            self.stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
+
+            y += 2
+            self.stdscr.addstr(y, 2, f"Estado: {cookies_msg}")
+            y += 2
+            self.stdscr.addstr(y, 2, "Sin cookies válidas, el scraping no funcionará correctamente.")
+            y += 1
+            self.stdscr.addstr(y, 2, "Se recomienda ejecutar --setup primero para obtener cookies frescas.")
+
+            y += 3
+            self.stdscr.attron(curses.A_BOLD)
+            self.stdscr.addstr(y, 2, "¿Qué deseas hacer?")
+            self.stdscr.attroff(curses.A_BOLD)
+            y += 2
+            self.stdscr.addstr(y, 4, "[S] Ejecutar --setup ahora (abre navegador visible)")
+            y += 1
+            self.stdscr.addstr(y, 4, "[C] Continuar de todos modos (no recomendado)")
+            y += 1
+            self.stdscr.addstr(y, 4, "[Esc] Cancelar")
+
+            self.stdscr.refresh()
+            self.stdscr.timeout(-1)  # Block for input
+
+            try:
+                key = self.stdscr.getch()
+                if key == ord('s') or key == ord('S'):
+                    self.run_setup_mode()
+                    # After setup, re-check cookies
+                    cookies_valid, cookies_msg = self.check_cookies_valid()
+                    if not cookies_valid:
+                        self.show_message("Setup completado pero cookies aún no válidas. Inténtalo de nuevo.")
+                        self.stdscr.timeout(100)
+                        return
+                elif key == ord('c') or key == ord('C'):
+                    pass  # Continue anyway
+                else:
+                    self.stdscr.timeout(100)
+                    return
+            finally:
+                self.stdscr.timeout(100)
+
+        # Now show the new scraping form
+        self.show_new_scraping_form()
+
+    def show_selection_list(self, title: str, items: list, display_key: str = 'name',
+                            allow_back: bool = False) -> tuple:
+        """
+        Shows a scrollable selection list and returns the selected item.
+
+        Args:
+            title: Title to show at the top
+            items: List of dicts to choose from
+            display_key: Key in each dict to display
+            allow_back: If True, allows going back with 'B' key
+
+        Returns:
+            Tuple of (selected_item, action) where action is 'selected', 'skipped', 'back', or 'cancelled'
+        """
+        if not items:
+            return None, 'skipped'
+
+        height, width = self.stdscr.getmaxyx()
+        selected = 0
+        scroll_offset = 0
+        max_visible = height - 10  # Leave room for header and footer
+
+        while True:
+            self.stdscr.clear()
+            self.draw_header()
+
+            y = 3
+            self.stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+            self.stdscr.addstr(y, 2, f"═══ {title} ═══")
+            self.stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+
+            y += 2
+            self.stdscr.addstr(y, 2, f"Selecciona una opción ({len(items)} disponibles):")
+            y += 2
+
+            # Calculate visible range
+            if selected < scroll_offset:
+                scroll_offset = selected
+            elif selected >= scroll_offset + max_visible:
+                scroll_offset = selected - max_visible + 1
+
+            visible_items = items[scroll_offset:scroll_offset + max_visible]
+
+            for i, item in enumerate(visible_items):
+                actual_index = scroll_offset + i
+                prefix = "→ " if actual_index == selected else "  "
+
+                if actual_index == selected:
+                    self.stdscr.attron(curses.A_REVERSE)
+
+                display_text = item.get(display_key, str(item))
+                # Truncate if too long
+                max_text_len = width - 8
+                if len(display_text) > max_text_len:
+                    display_text = display_text[:max_text_len - 3] + "..."
+
+                line = f"{prefix}{display_text}"
+                try:
+                    self.stdscr.addstr(y + i, 2, line[:width - 4])
+                except curses.error:
+                    pass
+
+                if actual_index == selected:
+                    self.stdscr.attroff(curses.A_REVERSE)
+
+            # Scroll indicators
+            if scroll_offset > 0:
+                self.stdscr.addstr(y - 1, width - 10, "↑ más ↑")
+            if scroll_offset + max_visible < len(items):
+                self.stdscr.addstr(y + len(visible_items), width - 10, "↓ más ↓")
+
+            # Footer
+            footer_y = height - 3
+            self.stdscr.addstr(footer_y, 2, "─" * (width - 4))
+            self.stdscr.attron(curses.A_DIM)
+            back_hint = "  [B] Volver" if allow_back else ""
+            self.stdscr.addstr(footer_y + 1, 2, f"[↑/↓] Navegar  [Enter] Seleccionar  [Esc] Omitir{back_hint}")
+            self.stdscr.attroff(curses.A_DIM)
+
+            self.stdscr.refresh()
+            self.stdscr.timeout(-1)
+            key = self.stdscr.getch()
+
+            if key == 27:  # Escape - skip this selection
+                return None, 'skipped'
+            elif allow_back and (key == ord('b') or key == ord('B')):
+                return None, 'back'
+            elif key == curses.KEY_UP or key == ord('k'):
+                selected = max(0, selected - 1)
+            elif key == curses.KEY_DOWN or key == ord('j'):
+                selected = min(len(items) - 1, selected + 1)
+            elif key == curses.KEY_PPAGE:  # Page Up
+                selected = max(0, selected - max_visible)
+            elif key == curses.KEY_NPAGE:  # Page Down
+                selected = min(len(items) - 1, selected + max_visible)
+            elif key == curses.KEY_HOME:
+                selected = 0
+            elif key == curses.KEY_END:
+                selected = len(items) - 1
+            elif key == ord('\n') or key == curses.KEY_ENTER:
+                return items[selected], 'selected'
+
+    def get_geonames_username(self) -> str:
+        """Gets geonames username from setup_config.json or prompts for it."""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        setup_config_path = os.path.join(script_dir, "browser_data", "setup_config.json")
+
+        if os.path.exists(setup_config_path):
+            try:
+                with open(setup_config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    if config.get('geonames_username'):
+                        return config['geonames_username']
+            except:
+                pass
+        return 'demo'  # Fallback (limited API calls)
+
+    def load_wizard_config(self) -> dict:
+        """Loads the last wizard configuration from file."""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        wizard_config_path = os.path.join(script_dir, "cache", "wizard_config.json")
+
+        default_config = {
+            'country_code': 'ES',
+            'query': '',
+            'min_population': 50000,
+            'max_population': None,
+            'strategy': 'simple',
+            'max_results': 300,
+            'workers': 1,
+            'region_code': None,
+            'region_name': None,
+            'adm2_code': None,
+            'adm2_name': None,
+        }
+
+        # Try wizard_config first (last wizard execution)
+        if os.path.exists(wizard_config_path):
+            try:
+                with open(wizard_config_path, 'r', encoding='utf-8') as f:
+                    saved = json.load(f)
+                    default_config.update(saved)
+                    return default_config
+            except:
+                pass
+
+        # Fallback to setup_config (from --setup)
+        setup_config_path = os.path.join(script_dir, "browser_data", "setup_config.json")
+        if os.path.exists(setup_config_path):
+            try:
+                with open(setup_config_path, 'r', encoding='utf-8') as f:
+                    saved = json.load(f)
+                    default_config.update(saved)
+            except:
+                pass
+
+        return default_config
+
+    def save_wizard_config(self, config: dict):
+        """Saves the wizard configuration for next time."""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        wizard_config_path = os.path.join(script_dir, "cache", "wizard_config.json")
+
+        try:
+            # Only save relevant fields
+            save_config = {
+                'country_code': config.get('country_code'),
+                'query': config.get('query'),
+                'min_population': config.get('min_population'),
+                'max_population': config.get('max_population'),
+                'strategy': config.get('strategy'),
+                'max_results': config.get('max_results'),
+                'workers': config.get('workers'),
+                'region_code': config.get('region_code'),
+                'region_name': config.get('region_name'),
+                'adm2_code': config.get('adm2_code'),
+                'adm2_name': config.get('adm2_name'),
+            }
+            with open(wizard_config_path, 'w', encoding='utf-8') as f:
+                json.dump(save_config, f, ensure_ascii=False, indent=2)
+        except:
+            pass  # Non-critical
+
+    def show_new_scraping_form(self):
+        """Shows the form to configure a new scraping job with region/subdivision support.
+
+        Supports navigation back through phases with 'B' key.
+        """
+        height, width = self.stdscr.getmaxyx()
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # Load configuration from last wizard or setup
+        config = self.load_wizard_config()
+        geonames_username = self.get_geonames_username()
+
+        # State machine for phases
+        phase = 1  # 1=basic, 2=region, 3=subdivision, 4=confirm
+
+        # Cached data
+        regions = []
+        subdivisions = []
+        final_config = {}
+
+        while True:
+            # ==================== PHASE 1: Basic Configuration ====================
+            if phase == 1:
+                fields = [
+                    ('country_code', 'País (2 letras)', config.get('country_code', 'ES')),
+                    ('query', 'Término de búsqueda', config.get('query', '')),
+                    ('min_population', 'Población mínima', str(config.get('min_population', 50000))),
+                    ('max_population', 'Población máxima (vacío=sin límite)', str(config.get('max_population') or '')),
+                    ('workers', 'Workers paralelos (1-10)', str(config.get('workers', 1))),
+                    ('strategy', 'Estrategia (simple/grid)', config.get('strategy', 'simple')),
+                    ('max_results', 'Max resultados por celda', str(config.get('max_results', 300))),
+                ]
+
+                current_field = 0
+                values = [f[2] for f in fields]
+
+                curses.echo()
+                curses.curs_set(1)
+
+                phase1_done = False
+                cancelled = False
+
+                while not phase1_done and not cancelled:
+                    self.stdscr.clear()
+                    self.draw_header()
+
+                    y = 3
+                    self.stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+                    self.stdscr.addstr(y, 2, "═══ NUEVO SCRAPING (1/3: Configuración básica) ═══")
+                    self.stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+
+                    y += 2
+                    self.stdscr.addstr(y, 2, "Completa los campos:")
+                    y += 2
+
+                    # Draw fields
+                    for i, (key, label, _) in enumerate(fields):
+                        prefix = "→ " if i == current_field else "  "
+                        if i == current_field:
+                            self.stdscr.attron(curses.A_BOLD)
+
+                        field_line = f"{prefix}{label}: {values[i]}"
+                        self.stdscr.addstr(y + i, 2, field_line[:width - 4])
+
+                        if i == current_field:
+                            self.stdscr.attroff(curses.A_BOLD)
+
+                    # Instructions
+                    y += len(fields) + 2
+                    self.stdscr.addstr(y, 2, "─" * (width - 4))
+                    y += 1
+                    self.stdscr.attron(curses.A_DIM)
+                    self.stdscr.addstr(y, 2, "[Tab/↓] Siguiente  [↑] Anterior  [Enter] Editar campo  [Esc] Cancelar")
+                    y += 1
+                    self.stdscr.addstr(y + 1, 2, "En el último campo, [Enter] avanza al siguiente paso.")
+                    self.stdscr.attroff(curses.A_DIM)
+
+                    self.stdscr.refresh()
+
+                    # Position cursor
+                    field_y = 7 + current_field
+                    label = fields[current_field][1]
+                    cursor_x = 4 + len(label) + 2 + len(values[current_field])
+                    try:
+                        self.stdscr.move(field_y, min(cursor_x, width - 2))
+                    except curses.error:
+                        pass
+
+                    self.stdscr.timeout(-1)
+                    key = self.stdscr.getch()
+
+                    if key == 27:  # Escape - cancel
+                        cancelled = True
+
+                    elif key == curses.KEY_DOWN or key == ord('\t'):
+                        current_field = (current_field + 1) % len(fields)
+
+                    elif key == curses.KEY_UP or key == curses.KEY_BTAB:
+                        current_field = (current_field - 1) % len(fields)
+
+                    elif key == ord('\n') or key == curses.KEY_ENTER:
+                        if current_field == len(fields) - 1:
+                            # Last field - proceed
+                            phase1_done = True
+                        else:
+                            # Edit current field
+                            self.stdscr.addstr(field_y, 4 + len(fields[current_field][1]) + 2, " " * 40)
+                            self.stdscr.move(field_y, 4 + len(fields[current_field][1]) + 2)
+                            self.stdscr.refresh()
+
+                            try:
+                                input_bytes = self.stdscr.getstr(40)
+                                new_value = input_bytes.decode('utf-8').strip()
+                                if new_value:
+                                    values[current_field] = new_value
+                            except:
+                                pass
+
+                            current_field = (current_field + 1) % len(fields)
+
+                    elif key == curses.KEY_BACKSPACE or key == 127 or key == 8:
+                        if values[current_field]:
+                            values[current_field] = values[current_field][:-1]
+
+                    elif 32 <= key <= 126:
+                        values[current_field] += chr(key)
+
+                curses.noecho()
+                curses.curs_set(0)
+
+                if cancelled:
+                    self.show_message("Cancelado")
+                    self.stdscr.timeout(100)
+                    return
+
+                # Validate
+                try:
+                    final_config = {
+                        'country_code': values[0].upper().strip(),
+                        'query': values[1].strip(),
+                        'min_population': int(values[2]) if values[2].strip() else 50000,
+                        'max_population': int(values[3]) if values[3].strip() else None,
+                        'workers': max(1, min(10, int(values[4]) if values[4].strip() else 1)),
+                        'strategy': values[5].strip().lower() if values[5].strip() in ['simple', 'grid'] else 'simple',
+                        'max_results': int(values[6]) if values[6].strip() else 300,
+                        'region_code': None,
+                        'region_name': None,
+                        'adm2_code': None,
+                        'adm2_name': None,
+                    }
+
+                    if len(final_config['country_code']) != 2:
+                        self.show_message("Error: Código de país debe ser 2 letras")
+                        continue
+
+                    if not final_config['query']:
+                        self.show_message("Error: El término de búsqueda es obligatorio")
+                        continue
+
+                    phase = 2  # Move to region selection
+
+                except ValueError as e:
+                    self.show_message(f"Error en valores: {e}")
+                    continue
+
+            # ==================== PHASE 2: Region Selection ====================
+            elif phase == 2:
+                # Fetch regions if not cached
+                if not regions:
+                    self.stdscr.clear()
+                    self.draw_header()
+                    self.stdscr.addstr(5, 2, f"Cargando regiones para {final_config['country_code']}...")
+                    self.stdscr.refresh()
+
+                    try:
+                        regions = asyncio.run(get_regions_for_country(
+                            final_config['country_code'],
+                            geonames_username
+                        ))
+                    except Exception as e:
+                        regions = []
+
+                if not regions:
+                    # No regions available, skip to confirmation
+                    phase = 4
+                    continue
+
+                # Ask about region filtering
+                self.stdscr.clear()
+                self.draw_header()
+                y = 5
+                self.stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+                self.stdscr.addstr(y, 2, "═══ NUEVO SCRAPING (2/3: Filtro por región) ═══")
+                self.stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+                y += 2
+                self.stdscr.addstr(y, 2, f"País: {final_config['country_code']} | {len(regions)} regiones disponibles")
+                y += 2
+                self.stdscr.addstr(y, 2, "¿Deseas filtrar por región específica?")
+                y += 2
+                self.stdscr.addstr(y, 4, "[S] Sí, seleccionar región")
+                y += 1
+                self.stdscr.addstr(y, 4, "[N] No, usar todo el país")
+                y += 1
+                self.stdscr.addstr(y, 4, "[B] Volver a configuración básica")
+                y += 1
+                self.stdscr.addstr(y, 4, "[Esc] Cancelar")
+                self.stdscr.refresh()
+
+                self.stdscr.timeout(-1)
+                key = self.stdscr.getch()
+
+                if key == 27:  # Escape
+                    self.show_message("Cancelado")
+                    self.stdscr.timeout(100)
+                    return
+                elif key == ord('b') or key == ord('B'):
+                    phase = 1
+                    regions = []  # Clear cache if going back
+                    continue
+                elif key == ord('n') or key == ord('N'):
+                    phase = 4  # Skip to confirmation
+                    continue
+                elif key == ord('s') or key == ord('S'):
+                    # Show region selection
+                    selected_region, action = self.show_selection_list(
+                        "SELECCIONAR REGIÓN",
+                        regions,
+                        'name',
+                        allow_back=True
+                    )
+
+                    if action == 'back':
+                        phase = 1
+                        regions = []
+                        continue
+                    elif action == 'skipped':
+                        phase = 4  # Skip to confirmation
+                        continue
+                    elif selected_region:
+                        final_config['region_code'] = selected_region['code']
+                        final_config['region_name'] = selected_region['name']
+                        phase = 3  # Move to subdivision
+                        subdivisions = []  # Clear cache
+                    else:
+                        phase = 4
+
+            # ==================== PHASE 3: Subdivision Selection ====================
+            elif phase == 3:
+                # Fetch subdivisions if not cached
+                if not subdivisions:
+                    self.stdscr.clear()
+                    self.draw_header()
+                    self.stdscr.addstr(5, 2, f"Cargando subdivisiones para {final_config['region_name']}...")
+                    self.stdscr.refresh()
+
+                    try:
+                        subdivisions = asyncio.run(get_subdivisions_for_region(
+                            final_config['country_code'],
+                            final_config['region_code'],
+                            geonames_username
+                        ))
+                    except:
+                        subdivisions = []
+
+                if not subdivisions:
+                    # No subdivisions, go to confirmation
+                    phase = 4
+                    continue
+
+                # Ask about subdivision filtering
+                self.stdscr.clear()
+                self.draw_header()
+                y = 5
+                self.stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+                self.stdscr.addstr(y, 2, "═══ NUEVO SCRAPING (3/3: Filtro por subdivisión) ═══")
+                self.stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+                y += 2
+                self.stdscr.addstr(y, 2, f"Región: {final_config['region_name']} | {len(subdivisions)} subdivisiones")
+                y += 2
+                self.stdscr.addstr(y, 2, "¿Deseas filtrar por subdivisión específica?")
+                y += 2
+                self.stdscr.addstr(y, 4, "[S] Sí, seleccionar subdivisión")
+                y += 1
+                self.stdscr.addstr(y, 4, "[N] No, usar toda la región")
+                y += 1
+                self.stdscr.addstr(y, 4, "[B] Volver a selección de región")
+                y += 1
+                self.stdscr.addstr(y, 4, "[Esc] Cancelar")
+                self.stdscr.refresh()
+
+                self.stdscr.timeout(-1)
+                key = self.stdscr.getch()
+
+                if key == 27:
+                    self.show_message("Cancelado")
+                    self.stdscr.timeout(100)
+                    return
+                elif key == ord('b') or key == ord('B'):
+                    final_config['region_code'] = None
+                    final_config['region_name'] = None
+                    phase = 2
+                    continue
+                elif key == ord('n') or key == ord('N'):
+                    phase = 4
+                    continue
+                elif key == ord('s') or key == ord('S'):
+                    selected_sub, action = self.show_selection_list(
+                        f"SUBDIVISIONES DE {final_config['region_name'].upper()}",
+                        subdivisions,
+                        'name',
+                        allow_back=True
+                    )
+
+                    if action == 'back':
+                        final_config['region_code'] = None
+                        final_config['region_name'] = None
+                        phase = 2
+                        continue
+                    elif selected_sub:
+                        final_config['adm2_code'] = selected_sub['code']
+                        final_config['adm2_name'] = selected_sub['name']
+
+                    phase = 4
+
+            # ==================== PHASE 4: Confirmation ====================
+            elif phase == 4:
+                self.stdscr.clear()
+                self.draw_header()
+                y = 4
+                self.stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+                self.stdscr.addstr(y, 2, "═══ CONFIRMAR CONFIGURACIÓN ═══")
+                self.stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+
+                y += 2
+                self.stdscr.addstr(y, 2, f"País: {final_config['country_code']}")
+                y += 1
+                if final_config.get('region_name'):
+                    self.stdscr.addstr(y, 2, f"Región: {final_config['region_name']} ({final_config['region_code']})")
+                    y += 1
+                if final_config.get('adm2_name'):
+                    self.stdscr.addstr(y, 2, f"Subdivisión: {final_config['adm2_name']} ({final_config['adm2_code']})")
+                    y += 1
+                self.stdscr.addstr(y, 2, f"Búsqueda: {final_config['query']}")
+                y += 1
+                pop_range = f"{final_config['min_population']:,}"
+                if final_config.get('max_population'):
+                    pop_range += f" - {final_config['max_population']:,}"
+                else:
+                    pop_range += "+"
+                self.stdscr.addstr(y, 2, f"Población: {pop_range}")
+                y += 1
+                self.stdscr.addstr(y, 2, f"Estrategia: {final_config['strategy']} | Workers: {final_config['workers']} | Max resultados: {final_config['max_results']}")
+
+                y += 3
+                self.stdscr.attron(curses.A_BOLD)
+                self.stdscr.addstr(y, 2, "¿Lanzar scraping?")
+                self.stdscr.attroff(curses.A_BOLD)
+                y += 2
+                self.stdscr.addstr(y, 4, "[Enter] Sí, lanzar")
+                y += 1
+                self.stdscr.addstr(y, 4, "[B] Volver atrás")
+                y += 1
+                self.stdscr.addstr(y, 4, "[Esc] Cancelar")
+                self.stdscr.refresh()
+
+                self.stdscr.timeout(-1)
+                key = self.stdscr.getch()
+
+                if key == 27:
+                    self.show_message("Cancelado")
+                    self.stdscr.timeout(100)
+                    return
+                elif key == ord('b') or key == ord('B'):
+                    # Go back to appropriate phase
+                    if final_config.get('adm2_code'):
+                        final_config['adm2_code'] = None
+                        final_config['adm2_name'] = None
+                        phase = 3
+                    elif final_config.get('region_code'):
+                        final_config['region_code'] = None
+                        final_config['region_name'] = None
+                        phase = 2
+                    else:
+                        phase = 2 if regions else 1
+                    continue
+                elif key == ord('\n') or key == curses.KEY_ENTER:
+                    # Save config and launch
+                    self.save_wizard_config(final_config)
+                    self.launch_new_scraping(final_config)
+                    self.stdscr.timeout(100)
+                    return
+
+    def launch_new_scraping(self, config: dict):
+        """Launches a new scraping job with the given configuration."""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_path = os.path.join(script_dir, "scrape_maps_interactive.py")
+        log_file = os.path.join(script_dir, "scrapping_background.log")
+
+        # Build command
+        cmd = [
+            sys.executable, script_path,
+            '--batch',
+            '--country_code', config['country_code'],
+            '--query', config['query'],
+            '--min_population', str(config['min_population']),
+            '--strategy', config['strategy'],
+            '--max_results', str(config['max_results']),
+            '--workers', str(config['workers']),
+        ]
+
+        if config.get('max_population'):
+            cmd.extend(['--max_population', str(config['max_population'])])
+
+        # Add region filter if specified
+        if config.get('region_code'):
+            cmd.extend(['--region_code', config['region_code']])
+
+        # Add subdivision (ADM2) filter if specified
+        if config.get('adm2_code'):
+            cmd.extend(['--adm2_code', config['adm2_code']])
+
+        try:
+            with open(log_file, 'a') as lf:
+                lf.write(f"\n{'='*60}\n")
+                lf.write(f"Nuevo scraping lanzado desde manager\n")
+                lf.write(f"Config: {json.dumps(config, ensure_ascii=False)}\n")
+                lf.write(f"Timestamp: {datetime.now().isoformat()}\n")
+                lf.write(f"{'='*60}\n")
+
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=lf,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True
+                )
+
+            self.show_message(f"Scraping lanzado con PID {proc.pid}", 5.0)
+            self.view_mode = "active"  # Switch to active view
+
+        except Exception as e:
+            self.show_message(f"Error lanzando scraping: {e}")
 
     def update_pending_commands(self):
         """Updates pending commands based on actual instance status.

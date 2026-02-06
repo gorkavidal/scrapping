@@ -422,10 +422,12 @@ class ControlThread(threading.Thread):
 class StatsThread(threading.Thread):
     """
     Thread que escribe estadísticas a disco periódicamente.
+
+    Soporta stats acumuladas de ejecuciones anteriores (para --resume).
     """
 
     def __init__(self, pid: int, job: Job, job_manager: JobManager,
-                 update_interval: float = 5.0):
+                 update_interval: float = 5.0, base_stats: JobStats = None):
         super().__init__(daemon=True)
         self.pid = pid
         self.job = job
@@ -433,7 +435,14 @@ class StatsThread(threading.Thread):
         self.update_interval = update_interval
 
         # Stats compartidas (el worker las actualiza)
-        self.stats = JobStats()
+        # Si hay base_stats (de un resume), usarlas como punto de partida
+        if base_stats:
+            self.stats = base_stats
+            self.base_runtime = base_stats.runtime_seconds  # Tiempo acumulado anterior
+        else:
+            self.stats = JobStats()
+            self.base_runtime = 0.0
+
         self.status = JobStatus.RUNNING
         self.start_time = time.time()
 
@@ -456,8 +465,8 @@ class StatsThread(threading.Thread):
         while self._running:
             try:
                 with self._lock:
-                    # Actualizar runtime
-                    self.stats.runtime_seconds = time.time() - self.start_time
+                    # Actualizar runtime (sesión actual + acumulado anterior)
+                    self.stats.runtime_seconds = self.base_runtime + (time.time() - self.start_time)
 
                     # Guardar instancia
                     instance = self.job_manager.load_instance(self.pid)
