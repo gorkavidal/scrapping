@@ -327,6 +327,106 @@ Estas constantes se definen al inicio del script y controlan el comportamiento d
     --max_results 50
 ```
 
+## Gestor de instancias (scrape_manager.py)
+
+El gestor de instancias proporciona una interfaz interactiva tipo `htop` para controlar los procesos de scraping en ejecucion. Permite monitorizar, pausar, reanudar, parar y modificar workers de las instancias activas en tiempo real.
+
+### Lanzar el gestor
+
+```bash
+.venv/bin/python scrape_manager.py
+```
+
+### Vistas disponibles
+
+El gestor tiene tres vistas principales:
+
+| Vista | Tecla | Descripcion |
+|-------|-------|-------------|
+| Instancias activas | `1` | Procesos de scraping en ejecucion con metricas en tiempo real |
+| Historico de jobs | `2` | Todos los jobs ejecutados (completados, interrumpidos, fallidos) |
+| Visor de archivos | `F` | Vista tabular del CSV de resultados de la instancia seleccionada |
+
+### Controles en vista de instancias activas
+
+| Tecla | Accion | Descripcion |
+|-------|--------|-------------|
+| `P` | Pausar | Pausa la instancia seleccionada. El proceso espera sin consumir recursos. |
+| `R` | Reanudar | Reanuda una instancia pausada. |
+| `S` | Stop graceful | Envia senal de parada. El proceso termina la ciudad actual y para. |
+| `K` | Kill | Termina el proceso inmediatamente con SIGKILL. Util para procesos pausados. |
+| `W` | Workers | Cambia el numero de workers. Para el proceso y lo relanza con la nueva configuracion. |
+| `F` | Files | Abre el visor de archivos con los resultados de la instancia seleccionada. |
+| `↑/↓` o `j/k` | Navegar | Mueve la seleccion entre instancias. |
+
+### Controles en vista de historico
+
+| Tecla | Accion | Descripcion |
+|-------|--------|-------------|
+| `Enter` | Revivir | Relanza un job interrumpido o fallido usando `--resume`. |
+| `D` | Eliminar | Elimina el job del historico (no afecta archivos de resultados). |
+| `F` | Files | Abre el visor de archivos con los resultados del job seleccionado. |
+
+### Controles en visor de archivos
+
+| Tecla | Accion | Descripcion |
+|-------|--------|-------------|
+| `↑/↓` o `j/k` | Scroll | Navega por los registros del CSV. |
+| `PgUp/PgDn` | Scroll rapido | Salta 20 registros arriba/abajo. |
+| `E` | Toggle emails | Alterna entre mostrar emails corporativos o todos los emails. |
+
+### Columnas en vista de instancias activas
+
+| Columna | Descripcion |
+|---------|-------------|
+| PID | ID del proceso del sistema operativo |
+| Estado | Estado actual: `running`, `paused`, `stopping`, o comando pendiente (`PAUSING...`, etc.) |
+| W | Numero de workers configurados |
+| Cities | Ciudades procesadas / total |
+| Total | Total de resultados extraidos |
+| Emails | Resultados con email encontrado |
+| Runtime | Tiempo de ejecucion |
+| Ciudad Actual | Ciudad que se esta procesando actualmente |
+
+### Panel de detalles
+
+Debajo de la lista de instancias se muestra informacion detallada de la instancia seleccionada:
+
+- **Job ID**: Identificador unico del trabajo
+- **Query**: Termino de busqueda configurado
+- **Pais**: Codigo de pais
+- **Poblacion minima**: Filtro de poblacion
+- **Estrategia**: `simple` o `grid`
+- **Max resultados**: Limite de resultados por celda
+- **Con email corporativo**: Emails que coinciden con el dominio del negocio
+- **Con web**: Negocios con pagina web
+- **Errores**: Numero de errores durante la ejecucion
+- **ETA**: Tiempo estimado restante basado en la media por ciudad
+
+### Cambio dinamico de workers
+
+Al pulsar `W` para cambiar el numero de workers:
+
+1. **Si el proceso esta pausado**: Se hace kill directo (el checkpoint ya esta guardado) y se relanza inmediatamente con los nuevos workers.
+
+2. **Si el proceso esta en ejecucion**: Se envia STOP y se espera a que termine la ciudad actual. Durante la espera se muestra un contador y puedes:
+   - Pulsar `F` para forzar kill inmediato
+   - Pulsar `Esc` para cancelar y dejar el proceso corriendo
+
+El proceso se relanza automaticamente con `--resume` usando el nuevo numero de workers.
+
+### Persistencia de comandos
+
+Los estados de comando (`PAUSING...`, `STOPPING...`, etc.) se muestran en la columna Estado hasta que el proceso confirma el cambio de estado. Esto proporciona feedback visual de que el comando fue enviado y esta pendiente de ejecucion.
+
+### Latencia de comandos
+
+Los comandos (pause, resume, stop) se envian via archivos en `cache/control/` y son leidos por el scraper cada ~1 segundo. Los cambios de estado se reflejan en la siguiente iteracion del worker.
+
+### Limpieza automatica
+
+El gestor detecta automaticamente procesos muertos (zombies) y los limpia del registro de instancias activas, marcando sus jobs como `interrupted` en el historico.
+
 ## Notas importantes
 
 - **Primera ejecucion**: Siempre ejecuta `--setup` primero para aceptar cookies/verificaciones de Google Maps. Sin este paso, el scraping en modo headless no obtendra resultados.
@@ -334,4 +434,5 @@ Estas constantes se definen al inicio del script y controlan el comportamiento d
 - **Rate limiting**: Google Maps puede limitar las peticiones si se hacen demasiadas en poco tiempo. Usar pocos workers (1-2) es mas seguro.
 - **Deduplicacion**: El script deduplica automaticamente por nombre+direccion+telefono y por web+telefono. No genera duplicados aunque las celdas se solapen.
 - **Interrupcion segura**: Puedes parar el proceso con `Ctrl+C` o `kill`. El checkpoint se guarda automaticamente y puedes retomar con `--resume`.
+- **Gestor de instancias**: Usa `scrape_manager.py` para controlar instancias en ejecucion sin interrumpir el scraping.
 - **GeoNames API**: Necesitas una cuenta gratuita en [geonames.org](https://www.geonames.org/login) para usar la API. El usuario por defecto es `gorkota`.

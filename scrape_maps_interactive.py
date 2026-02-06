@@ -23,6 +23,13 @@ import signal # Needed for graceful shutdown signal handling
 import sys
 import subprocess
 
+# Importar el sistema de gestión de jobs
+from job_manager import (
+    JobManager, Job, JobStatus, JobStats,
+    ControlThread, StatsThread, ControlCommand,
+    format_duration, calculate_eta
+)
+
 # Funciones auxiliares de logging
 def log_city_info(city_name, population):
     msg = f"{city_name:<30} {population:>8,} habitantes"
@@ -1103,8 +1110,8 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
 # 6. Función principal (main)
 # -----------------------------------------------------
 
-async def process_city(city_data: dict, config: dict, browser, semaphore, processed_businesses: set, temp_processed_businesses: set, cache_file: str, 
-                      final_csv: str, no_emails_csv: str, processed_cities: set, checkpoint_file: str) -> None:
+async def process_city(city_data: dict, config: dict, browser, semaphore, processed_businesses: set, temp_processed_businesses: set, cache_file: str,
+                      final_csv: str, no_emails_csv: str, processed_cities: set, checkpoint_file: str, stats_thread=None) -> None:
     city_name = city_data['name']
     country_code = config['country_code']
     strategy = config['strategy']
@@ -1179,7 +1186,17 @@ async def process_city(city_data: dict, config: dict, browser, semaphore, proces
             log_stats("Con correos corporativos:", with_emails)
             log_stats("Con web pero sin correos:", with_web)
             log_stats("Sin web ni correos:", without_both)
-            
+
+            # Update stats thread with result counts
+            if stats_thread:
+                current_stats = stats_thread.get_stats()
+                stats_thread.update_stats(
+                    results_total=current_stats.results_total + total_new,
+                    results_with_email=current_stats.results_with_email + with_emails,
+                    results_with_web=current_stats.results_with_web + with_web,
+                    results_with_corporate_email=current_stats.results_with_corporate_email + with_emails
+                )
+
             # Procesar y guardar resultados con correos
             if not df_with_emails.empty:
                 async with asyncio.Lock():
@@ -1265,6 +1282,12 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
     shutdown_event = asyncio.Event() # Event to signal shutdown
     dashboard_thread = None # Initialize thread var
 
+    # Job Manager variables
+    job_manager = None
+    current_job = None
+    control_thread = None
+    stats_thread = None
+
     # --- Signal Handler --- #
     # This allows asyncio to properly handle SIGINT/SIGTERM
     loop = asyncio.get_running_loop()
@@ -1299,7 +1322,9 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                             default=os.environ.get('GEONAMES_USERNAME', 'gorkota'), # Prioritize ENV, then 'gorkota'
                             help='Nombre de usuario de GeoNames (o variable de entorno GEONAMES_USERNAME, por defecto: gorkota)')
         parser.add_argument('--resume', action='store_true',
-                            help='Retomar la ejecución desde el último checkpoint')
+                            help='Retomar la ejecución desde el último checkpoint (en primer plano)')
+        parser.add_argument('--resume-background', action='store_true', dest='resume_background',
+                            help='Retomar la ejecución desde el último checkpoint (en segundo plano)')
         # Add optional args to override interactive prompts if needed
         parser.add_argument('--country_code', type=str, help='(Opcional) Código de país (ej. ES, GB) para saltar pregunta.')
         # --region argument now expects region *code* (adminCode1) if provided via CLI
@@ -1377,6 +1402,34 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
             print(f"Para ver progreso: tail -f {log_file}")
 
             with open(log_file, 'w') as lf:
+                proc = subprocess.Popen(
+                    cmd_parts,
+                    stdout=lf, stderr=subprocess.STDOUT,
+                    start_new_session=True
+                )
+            print(f"Proceso lanzado con PID: {proc.pid}")
+            print("Puedes cerrar esta terminal. El scraping continuará en segundo plano.")
+            return
+
+        # --- Modo --resume-background: retomar en segundo plano ---
+        if args.resume_background:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            log_file = os.path.join(script_dir, "scrapping_background.log")
+
+            cmd_parts = [
+                sys.executable, os.path.abspath(__file__),
+                '--resume',
+                '--batch'  # Para evitar cualquier input interactivo
+            ]
+
+            print(f"\nRetomando scraping en segundo plano...")
+            print(f"Log: {log_file}")
+            print(f"Para ver progreso: tail -f {log_file}")
+
+            with open(log_file, 'a') as lf:  # Append para no perder logs anteriores
+                lf.write(f"\n{'='*60}\n")
+                lf.write(f"Retomando ejecución: {datetime.now().isoformat()}\n")
+                lf.write(f"{'='*60}\n")
                 proc = subprocess.Popen(
                     cmd_parts,
                     stdout=lf, stderr=subprocess.STDOUT,
@@ -2050,6 +2103,23 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
         # Setup Semaphore for browser contexts
         scraper_semaphore = asyncio.Semaphore(CONCURRENT_BROWSERS)
 
+        # --- Job Manager Setup ---
+        job_manager = JobManager()
+
+        # Create or load job
+        current_job = job_manager.create_job(config)
+        current_job.checkpoint_file = checkpoint_file
+        current_job.csv_with_emails = final_csv
+        current_job.csv_no_emails = no_emails_csv
+        current_job.stats.cities_total = len(cities)
+        current_job.stats.cities_processed = len(processed_cities)
+        job_manager.save_job(current_job)
+
+        # Register this instance
+        pid = os.getpid()
+        job_manager.register_instance(pid, current_job, config)
+        logging.info(f"Job registrado: {current_job.job_id} (PID: {pid})")
+
         async with async_playwright() as p:
             # Launch browser once
             browser_lang_code = config.get('country_code', 'en').lower()
@@ -2065,6 +2135,17 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                 args=[browser_lang_arg]
             )
 
+            # --- Start Control and Stats threads ---
+            control_thread = ControlThread(pid, job_manager, poll_interval=1.0)
+            control_thread.start()
+            logging.debug("ControlThread iniciado")
+
+            stats_thread = StatsThread(pid, current_job, job_manager, update_interval=5.0)
+            stats_thread.stats.cities_total = len(cities)
+            stats_thread.stats.cities_processed = len(processed_cities)
+            stats_thread.start()
+            logging.debug("StatsThread iniciado")
+
             # Setup dashboard if curses available
             if stdscr:
                 # Set total for dashboard based on NEW cities
@@ -2079,10 +2160,32 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
             for city in cities_to_process:
                 await cities_queue.put(city) # Put the whole city dict
 
-            # Worker function (modified for graceful shutdown)
+            # Worker function (modified for graceful shutdown + control flags)
             async def worker(worker_id: int, shutdown_event: asyncio.Event):
                 logging.debug(f"Worker {worker_id}: Iniciado")
                 while not shutdown_event.is_set(): # Check event before getting item
+                    # --- Check control flags from ControlThread ---
+                    # Check stop flag
+                    if control_thread and control_thread.stop_flag:
+                        logging.info(f"Worker {worker_id}: Stop solicitado via manager, finalizando...")
+                        stats_thread.set_status(JobStatus.STOPPING)
+                        shutdown_event.set()  # Signal all workers to stop
+                        break
+
+                    # Check pause flag - wait while paused
+                    if control_thread and control_thread.pause_flag:
+                        if stats_thread:
+                            stats_thread.set_status(JobStatus.PAUSED)
+                        logging.info(f"Worker {worker_id}: Pausado. Esperando resume...")
+                        while control_thread.pause_flag and not control_thread.stop_flag:
+                            await asyncio.sleep(1.0)
+                        if control_thread.stop_flag:
+                            logging.info(f"Worker {worker_id}: Stop recibido durante pausa.")
+                            break
+                        logging.info(f"Worker {worker_id}: Resumiendo...")
+                        if stats_thread:
+                            stats_thread.set_status(JobStatus.RUNNING)
+
                     city_data = None
                     try:
                         # Get item with timeout to allow checking shutdown_event periodically
@@ -2107,7 +2210,20 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                         continue # Try next item
 
                     city_name = city_data['name']
+                    city_population = city_data.get('population', 0)
+                    city_start_time = time.time()
                     logging.debug(f"Worker {worker_id}: Procesando {city_name}")
+
+                    # Update stats with current city
+                    if stats_thread:
+                        current_index = len(processed_cities) + 1
+                        stats_thread.update_stats(
+                            current_city=city_name,
+                            current_city_index=current_index,
+                            current_city_population=city_population,
+                            current_city_start=datetime.now().isoformat()
+                        )
+
                     # Update dashboard state for this city
                     if stdscr:
                         dashboard_state['active_cities'][city_name].update({
@@ -2127,7 +2243,8 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                             final_csv=final_csv,
                             no_emails_csv=no_emails_csv,
                             processed_cities=processed_cities, # Pass the set to be updated
-                            checkpoint_file=checkpoint_file
+                            checkpoint_file=checkpoint_file,
+                            stats_thread=stats_thread  # Pass stats thread for metrics
                         )
                         # Update total processed count for dashboard after successful processing
                         current_total_processed = len(processed_cities)
@@ -2135,6 +2252,26 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                             dashboard_state['total_processed'] = current_total_processed
                             if city_name in dashboard_state['active_cities']:
                                 dashboard_state['active_cities'][city_name]['status'] = 'Completada'
+
+                        # Update stats after city completion
+                        if stats_thread:
+                            city_duration = time.time() - city_start_time
+                            current_stats = stats_thread.get_stats()
+                            # Calculate new average
+                            if current_total_processed > 0:
+                                # Weighted average including this city
+                                total_time = current_stats.avg_city_duration * (current_total_processed - 1) + city_duration
+                                new_avg = total_time / current_total_processed
+                            else:
+                                new_avg = city_duration
+                            stats_thread.update_stats(
+                                cities_processed=current_total_processed,
+                                current_city="",
+                                current_city_index=0,
+                                current_city_population=0,
+                                last_city_duration=city_duration,
+                                avg_city_duration=new_avg
+                            )
 
                     except asyncio.CancelledError:
                         # Handle cancellation during process_city
@@ -2146,6 +2283,10 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                         logging.error(f"Worker {worker_id}: Error procesando {city_name}: {e}", exc_info=True)
                         if stdscr and city_name in dashboard_state['active_cities']:
                             dashboard_state['active_cities'][city_name]['status'] = 'Error'
+                        # Update error count in stats
+                        if stats_thread:
+                            current_errors = stats_thread.stats.errors_count
+                            stats_thread.update_stats(errors_count=current_errors + 1)
                         # Log error but continue processing other cities if not cancelled
                     finally:
                         # Ensure task_done is called unless cancelled before retrieval
@@ -2261,6 +2402,14 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
 
     finally:
         # --- Final Cleanup --- #
+        # Stop control and stats threads
+        if control_thread:
+            control_thread.stop()
+            logging.debug("ControlThread detenido")
+        if stats_thread:
+            stats_thread.stop()
+            logging.debug("StatsThread detenido")
+
         # Ensure dashboard stops if it was started
         if 'dashboard_state' in globals():
             dashboard_state['running'] = False
@@ -2279,8 +2428,10 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
         else:
             logging.debug("Navegador no iniciado o ya cerrado.")
 
-        # Check if the process completed normally (not interrupted or errored)
+        # Determine final job status and update
+        final_status = JobStatus.INTERRUPTED
         if not shutdown_event.is_set() and 'cities_queue' in locals() and cities_queue.empty():
+            final_status = JobStatus.COMPLETED
             logging.info("Proceso completado normalmente.")
             # Completed successfully, remove checkpoint if it exists
             if 'checkpoint_file' in locals() and checkpoint_file and os.path.exists(checkpoint_file):
@@ -2292,7 +2443,21 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
         elif shutdown_event.is_set():
              logging.info("Proceso interrumpido.")
         else: # Probably an error happened before queue processing finished
+             final_status = JobStatus.FAILED
              logging.warning("El proceso terminó, pero el estado de finalización es incierto (posible error temprano).")
+
+        # Update job with final status
+        if job_manager and current_job:
+            try:
+                current_job.status = final_status
+                current_job.finished_at = datetime.now().isoformat()
+                if stats_thread:
+                    current_job.stats = stats_thread.get_stats()
+                job_manager.save_job(current_job)
+                job_manager.unregister_instance(os.getpid())
+                logging.info(f"Job {current_job.job_id} finalizado con estado: {final_status}")
+            except Exception as e:
+                logging.error(f"Error actualizando job final: {e}")
 
 
 if __name__ == "__main__":
