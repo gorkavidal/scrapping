@@ -6,15 +6,22 @@ Proporciona:
 - Registro de instancias vivas
 - Control de instancias (pause, resume, stop, workers)
 - Métricas en tiempo real
+
+Optimizaciones v2:
+- Escritura atómica de JSON (write to temp + rename)
+- Cache con TTL para reducir I/O
+- Debounce de cleanup
+- Validación JSON robusta
 """
 
 import os
 import json
 import threading
 import time
+import tempfile
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
 
 
@@ -148,8 +155,27 @@ class Instance:
         )
 
 
+@dataclass
+class CacheEntry:
+    """Entrada de cache con TTL."""
+    data: Any
+    mtime: float  # Modification time del archivo
+    cached_at: float  # Cuándo se cacheó
+
+
 class JobManager:
-    """Gestiona la persistencia de jobs e instancias."""
+    """Gestiona la persistencia de jobs e instancias.
+
+    Optimizaciones:
+    - Cache con TTL para reducir lecturas de disco
+    - Escritura atómica para evitar corrupción
+    - Debounce de cleanup para no ejecutar cada frame
+    """
+
+    # TTL de cache en segundos
+    CACHE_TTL = 2.0
+    # Intervalo mínimo entre cleanups
+    CLEANUP_DEBOUNCE = 5.0
 
     def __init__(self, base_dir: str = None):
         if base_dir is None:
@@ -165,6 +191,15 @@ class JobManager:
         for d in [self.jobs_dir, self.instances_dir, self.control_dir]:
             os.makedirs(d, exist_ok=True)
 
+        # Cache para reducir I/O
+        self._job_cache: Dict[str, CacheEntry] = {}
+        self._instance_cache: Dict[int, CacheEntry] = {}
+        self._instances_list_cache: Optional[Tuple[float, List[Instance]]] = None
+        self._jobs_list_cache: Optional[Tuple[float, List[Job]]] = None
+
+        # Debounce para cleanup
+        self._last_cleanup_time = 0.0
+
     def _job_path(self, job_id: str) -> str:
         return os.path.join(self.jobs_dir, f"{job_id}.json")
 
@@ -173,6 +208,82 @@ class JobManager:
 
     def _control_path(self, pid: int) -> str:
         return os.path.join(self.control_dir, f"{pid}.json")
+
+    def _atomic_write_json(self, path: str, data: dict) -> bool:
+        """Escribe JSON de forma atómica: temp file + rename.
+
+        Esto evita que lecturas concurrentes lean archivos parcialmente escritos.
+        """
+        dir_path = os.path.dirname(path)
+        try:
+            # Crear archivo temporal en el mismo directorio (para que rename sea atómico)
+            fd, temp_path = tempfile.mkstemp(suffix='.tmp', dir=dir_path)
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                # Rename atómico (en el mismo filesystem)
+                os.replace(temp_path, path)
+                return True
+            except Exception:
+                # Limpiar archivo temporal si algo falla
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception:
+            return False
+
+    def _safe_read_json(self, path: str) -> Optional[dict]:
+        """Lee JSON con validación robusta.
+
+        Retorna None si el archivo no existe, está vacío, o es inválido.
+        No elimina archivos corruptos automáticamente para evitar race conditions.
+        """
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            if not content or not content.strip():
+                return None
+            data = json.loads(content)
+            if not isinstance(data, dict):
+                return None
+            return data
+        except (json.JSONDecodeError, IOError, OSError):
+            return None
+
+    def _is_cache_valid(self, cache_entry: Optional[CacheEntry], path: str) -> bool:
+        """Verifica si una entrada de cache sigue siendo válida."""
+        if cache_entry is None:
+            return False
+        # Verificar TTL
+        if time.time() - cache_entry.cached_at > self.CACHE_TTL:
+            return False
+        # Verificar si el archivo ha cambiado
+        try:
+            current_mtime = os.path.getmtime(path)
+            return current_mtime == cache_entry.mtime
+        except OSError:
+            return False
+
+    def invalidate_cache(self, job_id: str = None, pid: int = None):
+        """Invalida entradas específicas del cache."""
+        if job_id and job_id in self._job_cache:
+            del self._job_cache[job_id]
+        if pid and pid in self._instance_cache:
+            del self._instance_cache[pid]
+        # Invalidar listas
+        self._instances_list_cache = None
+        self._jobs_list_cache = None
+
+    def invalidate_all_cache(self):
+        """Invalida todo el cache."""
+        self._job_cache.clear()
+        self._instance_cache.clear()
+        self._instances_list_cache = None
+        self._jobs_list_cache = None
 
     # --- Jobs ---
 
@@ -193,35 +304,70 @@ class JobManager:
         return job
 
     def save_job(self, job: Job) -> None:
-        """Guarda un job a disco."""
-        with open(self._job_path(job.job_id), 'w', encoding='utf-8') as f:
-            json.dump(job.to_dict(), f, ensure_ascii=False, indent=2)
+        """Guarda un job a disco de forma atómica."""
+        path = self._job_path(job.job_id)
+        if self._atomic_write_json(path, job.to_dict()):
+            # Actualizar cache
+            try:
+                mtime = os.path.getmtime(path)
+                self._job_cache[job.job_id] = CacheEntry(
+                    data=job,
+                    mtime=mtime,
+                    cached_at=time.time()
+                )
+            except OSError:
+                pass
+        # Invalidar lista de jobs
+        self._jobs_list_cache = None
 
     def load_job(self, job_id: str) -> Optional[Job]:
-        """Carga un job desde disco."""
+        """Carga un job desde disco (con cache)."""
         path = self._job_path(job_id)
-        if not os.path.exists(path):
+
+        # Verificar cache
+        cache_entry = self._job_cache.get(job_id)
+        if self._is_cache_valid(cache_entry, path):
+            return cache_entry.data
+
+        # Leer de disco
+        data = self._safe_read_json(path)
+        if data is None:
+            # Archivo no existe o corrupto, limpiar cache
+            if job_id in self._job_cache:
+                del self._job_cache[job_id]
             return None
+
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                content = f.read()
-                if not content.strip():
-                    # Empty file - delete it
-                    os.remove(path)
-                    return None
-                return Job.from_dict(json.loads(content))
-        except (json.JSONDecodeError, KeyError, ValueError):
-            # Corrupted file - delete it
+            job = Job.from_dict(data)
+            # Actualizar cache
             try:
-                os.remove(path)
-            except:
+                mtime = os.path.getmtime(path)
+                self._job_cache[job_id] = CacheEntry(
+                    data=job,
+                    mtime=mtime,
+                    cached_at=time.time()
+                )
+            except OSError:
                 pass
+            return job
+        except (KeyError, ValueError, TypeError):
             return None
 
     def list_jobs(self) -> List[Job]:
-        """Lista todos los jobs."""
+        """Lista todos los jobs (con cache de lista)."""
+        # Verificar cache de lista
+        if self._jobs_list_cache is not None:
+            cache_time, cached_list = self._jobs_list_cache
+            if time.time() - cache_time < self.CACHE_TTL:
+                return cached_list
+
         jobs = []
-        for filename in os.listdir(self.jobs_dir):
+        try:
+            filenames = os.listdir(self.jobs_dir)
+        except OSError:
+            return []
+
+        for filename in filenames:
             if filename.endswith('.json'):
                 job_id = filename[:-5]
                 try:
@@ -229,18 +375,25 @@ class JobManager:
                     if job:
                         jobs.append(job)
                 except Exception:
-                    # Skip corrupted files
                     pass
+
         # Ordenar por fecha de creación (más reciente primero)
         jobs.sort(key=lambda j: j.created_at, reverse=True)
+
+        # Guardar en cache
+        self._jobs_list_cache = (time.time(), jobs)
         return jobs
 
     def delete_job(self, job_id: str) -> bool:
         """Elimina un job."""
         path = self._job_path(job_id)
         if os.path.exists(path):
-            os.remove(path)
-            return True
+            try:
+                os.remove(path)
+                self.invalidate_cache(job_id=job_id)
+                return True
+            except OSError:
+                return False
         return False
 
     # --- Instances ---
@@ -264,43 +417,97 @@ class JobManager:
         return instance
 
     def save_instance(self, instance: Instance) -> None:
-        """Guarda una instancia a disco."""
-        with open(self._instance_path(instance.pid), 'w', encoding='utf-8') as f:
-            json.dump(instance.to_dict(), f, ensure_ascii=False, indent=2)
+        """Guarda una instancia a disco de forma atómica."""
+        path = self._instance_path(instance.pid)
+        if self._atomic_write_json(path, instance.to_dict()):
+            # Actualizar cache
+            try:
+                mtime = os.path.getmtime(path)
+                self._instance_cache[instance.pid] = CacheEntry(
+                    data=instance,
+                    mtime=mtime,
+                    cached_at=time.time()
+                )
+            except OSError:
+                pass
+        # Invalidar lista
+        self._instances_list_cache = None
 
     def load_instance(self, pid: int) -> Optional[Instance]:
-        """Carga una instancia desde disco."""
+        """Carga una instancia desde disco (con cache)."""
         path = self._instance_path(pid)
-        if not os.path.exists(path):
+
+        # Verificar cache
+        cache_entry = self._instance_cache.get(pid)
+        if self._is_cache_valid(cache_entry, path):
+            return cache_entry.data
+
+        # Leer de disco
+        data = self._safe_read_json(path)
+        if data is None:
+            if pid in self._instance_cache:
+                del self._instance_cache[pid]
             return None
+
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                return Instance.from_dict(json.load(f))
-        except (json.JSONDecodeError, KeyError):
+            instance = Instance.from_dict(data)
+            # Actualizar cache
+            try:
+                mtime = os.path.getmtime(path)
+                self._instance_cache[pid] = CacheEntry(
+                    data=instance,
+                    mtime=mtime,
+                    cached_at=time.time()
+                )
+            except OSError:
+                pass
+            return instance
+        except (KeyError, ValueError, TypeError):
             return None
 
     def unregister_instance(self, pid: int) -> None:
         """Elimina el registro de una instancia (al terminar)."""
         path = self._instance_path(pid)
         if os.path.exists(path):
-            os.remove(path)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         # También eliminar el control file
         ctrl_path = self._control_path(pid)
         if os.path.exists(ctrl_path):
-            os.remove(ctrl_path)
+            try:
+                os.remove(ctrl_path)
+            except OSError:
+                pass
+        self.invalidate_cache(pid=pid)
 
     def list_instances(self) -> List[Instance]:
-        """Lista todas las instancias registradas."""
+        """Lista todas las instancias registradas (con cache de lista)."""
+        # Verificar cache de lista
+        if self._instances_list_cache is not None:
+            cache_time, cached_list = self._instances_list_cache
+            if time.time() - cache_time < self.CACHE_TTL:
+                return cached_list
+
         instances = []
-        for filename in os.listdir(self.instances_dir):
+        try:
+            filenames = os.listdir(self.instances_dir)
+        except OSError:
+            return []
+
+        for filename in filenames:
             if filename.endswith('.json'):
                 try:
                     pid = int(filename[:-5])
                     instance = self.load_instance(pid)
                     if instance:
                         instances.append(instance)
-                except ValueError:
+                except (ValueError, TypeError):
                     continue
+
+        # Guardar en cache
+        self._instances_list_cache = (time.time(), instances)
         return instances
 
     def is_instance_alive(self, pid: int) -> bool:
@@ -312,7 +519,16 @@ class JobManager:
             return False
 
     def cleanup_dead_instances(self) -> List[int]:
-        """Limpia instancias muertas y marca sus jobs como interrupted."""
+        """Limpia instancias muertas y marca sus jobs como interrupted.
+
+        Incluye debounce para no ejecutar en cada frame.
+        """
+        now = time.time()
+        # Debounce: no ejecutar más de una vez cada CLEANUP_DEBOUNCE segundos
+        if now - self._last_cleanup_time < self.CLEANUP_DEBOUNCE:
+            return []
+        self._last_cleanup_time = now
+
         dead_pids = []
         for instance in self.list_instances():
             if not self.is_instance_alive(instance.pid):
@@ -329,7 +545,7 @@ class JobManager:
     # --- Control ---
 
     def send_command(self, pid: int, command: str, value: Any = None) -> bool:
-        """Envía un comando a una instancia."""
+        """Envía un comando a una instancia (escritura atómica)."""
         instance = self.load_instance(pid)
         if not instance:
             return False
@@ -339,34 +555,23 @@ class JobManager:
             'value': value,
             'timestamp': datetime.now().isoformat(),
         }
-        with open(self._control_path(pid), 'w', encoding='utf-8') as f:
-            json.dump(ctrl_data, f)
-        return True
+        return self._atomic_write_json(self._control_path(pid), ctrl_data)
 
     def read_command(self, pid: int) -> Optional[Dict[str, Any]]:
         """Lee y consume un comando pendiente."""
         path = self._control_path(pid)
-        if not os.path.exists(path):
-            return None
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+        data = self._safe_read_json(path)
+        if data is not None:
             # Consumir el comando (eliminar el fichero)
-            os.remove(path)
-            return data
-        except (json.JSONDecodeError, FileNotFoundError):
-            return None
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return data
 
     def peek_command(self, pid: int) -> Optional[Dict[str, Any]]:
         """Lee un comando sin consumirlo."""
-        path = self._control_path(pid)
-        if not os.path.exists(path):
-            return None
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
-            return None
+        return self._safe_read_json(self._control_path(pid))
 
 
 class ControlThread(threading.Thread):

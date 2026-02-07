@@ -127,21 +127,63 @@ def setup_logging(dashboard_state):
         ]
     )
 
-# Añadir al inicio del archivo, después de los imports
-MAX_CONCURRENT_EXTRACTIONS = 20  # Aumentado de 10 a 20
+# =============================================================================
+# CONFIGURACIÓN GLOBAL - Optimizado v2
+# =============================================================================
+
+# Concurrencia
+MAX_CONCURRENT_EXTRACTIONS = 20  # Extracciones de email en paralelo
+CONCURRENT_BROWSERS = 8          # Contextos de browser concurrentes
+DEFAULT_WORKERS = 1              # Workers por defecto
 
 # Configuración de límites de búsqueda de emails
-MAX_CONTACT_LINKS = 3  # Máximo número de enlaces de contacto a revisar por URL principal
-MAX_TOTAL_TIME = 30   # Tiempo máximo en segundos para procesar una URL (principal + contactos)
-MAIN_PAGE_TIMEOUT = 15000  # Timeout en ms para cargar la página principal
-CONTACT_PAGE_TIMEOUT = 10000  # Timeout en ms para cargar páginas de contacto
-NETWORKIDLE_TIMEOUT = 5000  # Timeout en ms para esperar networkidle
+MAX_CONTACT_LINKS = 3            # Máx enlaces de contacto por URL principal
+MAX_TOTAL_TIME = 30              # Tiempo máx en segundos por URL
+MAIN_PAGE_TIMEOUT = 15000        # Timeout ms para página principal
+CONTACT_PAGE_TIMEOUT = 10000     # Timeout ms para páginas de contacto
+NETWORKIDLE_TIMEOUT = 5000       # Timeout ms para networkidle
 
-# Aumentar el número de contextos concurrentes
-CONCURRENT_BROWSERS = 8  # Aumentado de 4 a 8
+# Timeouts de scroll optimizados (reducidos de 2000ms a 1000ms)
+SCROLL_WAIT_MS = 1000            # Espera entre scrolls (antes 2000)
+SCROLL_RETRY_WAIT_MS = 1000      # Espera extra si no hay nuevos resultados (antes 2000)
+MAX_NO_NEW_RESULTS = 3           # Intentos sin nuevos resultados antes de parar
 
-# Número por defecto de workers en paralelo
-DEFAULT_WORKERS = 1
+# =============================================================================
+# RECURSOS COMPARTIDOS GLOBALES (optimización I/O)
+# =============================================================================
+
+# Sesión aiohttp compartida - se inicializa en main() y se cierra en finally
+_shared_aiohttp_session: aiohttp.ClientSession = None
+
+# Lock global para escritura CSV (evita crear locks nuevos cada vez)
+_csv_write_lock = asyncio.Lock()
+
+# Lock global para cache de negocios procesados
+_cache_lock = asyncio.Lock()
+
+# Lock global para escritura de checkpoint
+_checkpoint_lock = asyncio.Lock()
+
+# Contador de IDs en memoria para evitar leer CSV completo
+_csv_id_counters = {
+    'with_emails': 0,
+    'no_emails': 0
+}
+
+async def get_shared_session() -> aiohttp.ClientSession:
+    """Obtiene la sesión aiohttp compartida, creándola si no existe."""
+    global _shared_aiohttp_session
+    if _shared_aiohttp_session is None or _shared_aiohttp_session.closed:
+        timeout = aiohttp.ClientTimeout(total=30)
+        _shared_aiohttp_session = aiohttp.ClientSession(timeout=timeout)
+    return _shared_aiohttp_session
+
+async def close_shared_session():
+    """Cierra la sesión aiohttp compartida."""
+    global _shared_aiohttp_session
+    if _shared_aiohttp_session and not _shared_aiohttp_session.closed:
+        await _shared_aiohttp_session.close()
+        _shared_aiohttp_session = None
 
 # -----------------------------------------------------
 # 1. Funciones auxiliares para cargar ciudades (API GeoNames) y obtener su centro
@@ -150,58 +192,59 @@ DEFAULT_WORKERS = 1
 # <<<< GeoNames API Interaction Functions >>>>
 
 async def fetch_geonames_api(endpoint: str, params: dict) -> dict:
-    """Función genérica para llamar a la API de GeoNames."""
+    """Función genérica para llamar a la API de GeoNames.
+
+    Usa sesión aiohttp compartida para evitar overhead de conexión.
+    """
     base_url = "http://api.geonames.org/"
     url = f"{base_url}{endpoint}"
     logging.debug(f"Llamando a GeoNames API: {url} con params: {params}")
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, params=params, timeout=30) as response: # Increased timeout
-                response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-                # Check content type to decide how to parse
-                content_type = response.headers.get('Content-Type', '')
-                if 'application/json' in content_type:
+    session = await get_shared_session()
+    try:
+        async with session.get(url, params=params) as response:
+            response.raise_for_status()
+            # Check content type to decide how to parse
+            content_type = response.headers.get('Content-Type', '')
+            if 'application/json' in content_type:
+                data = await response.json()
+            elif 'text/xml' in content_type or 'text/html' in content_type:
+                # Attempt to parse as JSON first, might work for some errors
+                try:
                     data = await response.json()
-                elif 'text/xml' in content_type or 'text/html' in content_type: # Handle XML/HTML if JSON fails
-                    # Attempt to parse as JSON first, might work for some errors
-                    try:
-                        data = await response.json()
-                    except aiohttp.ContentTypeError:
-                        # If JSON parsing fails, return raw text for debugging
-                        text_data = await response.text()
-                        logging.warning(f"GeoNames devolvió tipo {content_type}. Contenido: {text_data[:200]}...")
-                        # Attempt to parse as dictionary if it looks like one (e.g., status message)
-                        if '{' in text_data and '}' in text_data:
-                            try:
-                                # Very basic check for status message
-                                status_match = re.search(r'"message"\s*:\s*"(.*?)"', text_data) # Removed extra quote at the end
-                                if status_match:
-                                    return {"status": {"message": status_match.group(1), "value": response.status}}
-                            except Exception:
-                                pass
-                        return {"error": "Formato no JSON inesperado", "status": response.status, "content_type": content_type, "text": text_data[:500]} # Limit text length
-                else:
-                    # Handle unexpected content types
+                except aiohttp.ContentTypeError:
+                    # If JSON parsing fails, return raw text for debugging
                     text_data = await response.text()
-                    logging.warning(f"GeoNames devolvió tipo inesperado: {content_type}. Contenido: {text_data[:200]}...")
-                    return {"error": f"Tipo de contenido inesperado: {content_type}", "status": response.status, "text": text_data[:500]}
-                
-                # Check for API error messages within the JSON response
-                if isinstance(data, dict) and 'status' in data:
-                    logging.error(f"Error de la API GeoNames: {data['status']['message']} (Valor: {data['status']['value']}) para params: {params}")
-                    return {"error": data['status']['message'], "status_code": data['status']['value']}
-                    
-                logging.debug(f"GeoNames API response received for {endpoint}")
-                return data
-        except aiohttp.ClientResponseError as e:
-            logging.error(f"Error HTTP llamando a GeoNames ({url}): {e.status} {e.message}")
-            return {"error": f"HTTP Error: {e.status} {e.message}", "status_code": e.status}
-        except asyncio.TimeoutError:
-            logging.error(f"Timeout llamando a GeoNames API: {url}")
-            return {"error": "Timeout"}
-        except Exception as e:
-            logging.error(f"Error inesperado llamando a GeoNames API ({url}): {e}")
-            return {"error": str(e)}
+                    logging.warning(f"GeoNames devolvió tipo {content_type}. Contenido: {text_data[:200]}...")
+                    if '{' in text_data and '}' in text_data:
+                        try:
+                            status_match = re.search(r'"message"\s*:\s*"(.*?)"', text_data)
+                            if status_match:
+                                return {"status": {"message": status_match.group(1), "value": response.status}}
+                        except Exception:
+                            pass
+                    return {"error": "Formato no JSON inesperado", "status": response.status, "content_type": content_type, "text": text_data[:500]}
+            else:
+                # Handle unexpected content types
+                text_data = await response.text()
+                logging.warning(f"GeoNames devolvió tipo inesperado: {content_type}. Contenido: {text_data[:200]}...")
+                return {"error": f"Tipo de contenido inesperado: {content_type}", "status": response.status, "text": text_data[:500]}
+
+            # Check for API error messages within the JSON response
+            if isinstance(data, dict) and 'status' in data:
+                logging.error(f"Error de la API GeoNames: {data['status']['message']} (Valor: {data['status']['value']}) para params: {params}")
+                return {"error": data['status']['message'], "status_code": data['status']['value']}
+
+            logging.debug(f"GeoNames API response received for {endpoint}")
+            return data
+    except aiohttp.ClientResponseError as e:
+        logging.error(f"Error HTTP llamando a GeoNames ({url}): {e.status} {e.message}")
+        return {"error": f"HTTP Error: {e.status} {e.message}", "status_code": e.status}
+    except asyncio.TimeoutError:
+        logging.error(f"Timeout llamando a GeoNames API: {url}")
+        return {"error": "Timeout"}
+    except Exception as e:
+        logging.error(f"Error inesperado llamando a GeoNames API ({url}): {e}")
+        return {"error": str(e)}
 
 async def get_regions_for_country(country_code: str, geonames_username: str) -> list:
     """Obtiene las divisiones administrativas de primer nivel (regiones/provincias, ADM1) para un país."""
@@ -460,39 +503,37 @@ async def get_city_location(city_name: str, country_code: str, city_data: dict =
         
     # Fallback to Nominatim if GeoNames coords are missing or invalid
     logging.info(f"Obteniendo ubicación para {city_name}, {country_code} desde Nominatim (fallback)")
-    async with aiohttp.ClientSession() as session:
-        # Use country code for better precision with Nominatim if available
-        url = f"https://nominatim.openstreetmap.org/search?q={quote_plus(city_name)}&countrycodes={country_code.lower()}&format=json&limit=1"
-        try:
-            # Add headers to mimic browser request
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-            async with session.get(url, headers=headers, timeout=15) as response: # Add timeout
-                if response.status != 200:
-                     logging.warning(f"Nominatim devolvió estado {response.status} para {city_name}, {country_code}")
-                     # Fallback query without country code
-                     url = f"https://nominatim.openstreetmap.org/search?q={quote_plus(f'{city_name}')}&format=json&limit=1"
-                     async with session.get(url, headers=headers, timeout=15) as fallback_response:
-                         if fallback_response.status == 200:
-                             data = await fallback_response.json()
-                         else:
-                             logging.error(f"Error en fallback de Nominatim para {city_name}: Estado {fallback_response.status}")
-                             data = []
-                else:
-                    data = await response.json()
-                
-                if data:
-                    center_lat = float(data[0]["lat"])
-                    center_lon = float(data[0]["lon"])
-                    logging.info(f"Ubicación de Nominatim para {city_name}: ({center_lat}, {center_lon})")
-                    return {"center_lat": center_lat, "center_lon": center_lon}
-                else:
-                    logging.warning(f"No se encontró ubicación en Nominatim para {city_name}, {country_code}")
-        except aiohttp.ClientError as e: # Catch specific aiohttp errors
-             logging.error(f"Error de red (aiohttp) al obtener ubicación de Nominatim para {city_name}: {e}")
-        except asyncio.TimeoutError:
-            logging.error(f"Timeout al obtener ubicación de Nominatim para {city_name}")
-        except Exception as e:
-            logging.error(f"Error inesperado al obtener ubicación de Nominatim para {city_name}: {e}", exc_info=True) # Log traceback
+    session = await get_shared_session()
+    url = f"https://nominatim.openstreetmap.org/search?q={quote_plus(city_name)}&countrycodes={country_code.lower()}&format=json&limit=1"
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        async with session.get(url, headers=headers) as response:
+            if response.status != 200:
+                logging.warning(f"Nominatim devolvió estado {response.status} para {city_name}, {country_code}")
+                # Fallback query without country code
+                url = f"https://nominatim.openstreetmap.org/search?q={quote_plus(f'{city_name}')}&format=json&limit=1"
+                async with session.get(url, headers=headers) as fallback_response:
+                    if fallback_response.status == 200:
+                        data = await fallback_response.json()
+                    else:
+                        logging.error(f"Error en fallback de Nominatim para {city_name}: Estado {fallback_response.status}")
+                        data = []
+            else:
+                data = await response.json()
+
+            if data:
+                center_lat = float(data[0]["lat"])
+                center_lon = float(data[0]["lon"])
+                logging.info(f"Ubicación de Nominatim para {city_name}: ({center_lat}, {center_lon})")
+                return {"center_lat": center_lat, "center_lon": center_lon}
+            else:
+                logging.warning(f"No se encontró ubicación en Nominatim para {city_name}, {country_code}")
+    except aiohttp.ClientError as e:
+        logging.error(f"Error de red (aiohttp) al obtener ubicación de Nominatim para {city_name}: {e}")
+    except asyncio.TimeoutError:
+        logging.error(f"Timeout al obtener ubicación de Nominatim para {city_name}")
+    except Exception as e:
+        logging.error(f"Error inesperado al obtener ubicación de Nominatim para {city_name}: {e}", exc_info=True)
     return None
 
 # -----------------------------------------------------
@@ -532,93 +573,143 @@ def generate_grid_cells(city_center: dict, grid_size: int, cell_size_m: float, s
 # -----------------------------------------------------
 
 async def extract_emails_from_url(url: str) -> set:
+    """Extrae emails de una URL usando la sesión aiohttp compartida."""
     emails_found = set()
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=15) as response:
-                await asyncio.sleep(0.5)
-                html = await response.text()
-                email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-                emails_found.update(re.findall(email_pattern, html))
+        session = await get_shared_session()
+        async with session.get(url) as response:
+            await asyncio.sleep(0.5)
+            html = await response.text()
+            email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+            emails_found.update(re.findall(email_pattern, html))
     except Exception as e:
         logging.debug(f"Error al extraer emails de {url}: {e}")
     return emails_found
 
-async def extract_contact_info(url, business_name="", extraction_semaphore: asyncio.Semaphore = None, current_index=0, total_urls=0) -> dict:
+
+async def _extract_emails_with_browser(browser, url: str, start_time: float,
+                                       emails_found: set, create_own_browser: bool = False) -> dict:
+    """Función auxiliar para extraer emails usando un browser Playwright.
+
+    Args:
+        browser: Instancia de browser Playwright
+        url: URL a procesar
+        start_time: Tiempo de inicio para controlar timeout
+        emails_found: Set para acumular emails encontrados
+        create_own_browser: Si True, cierra el browser al terminar
+
+    Returns:
+        dict con 'emails' (set) y 'error' (str)
+    """
+    error_message = ""
+    context = None
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+    try:
+        context = await browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        )
+        page = await context.new_page()
+
+        try:
+            await page.goto(url, timeout=MAIN_PAGE_TIMEOUT)
+            await page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
+
+            # Extraer emails del contenido HTML
+            content = await page.content()
+            found_emails = re.findall(email_pattern, content)
+            emails_found.update(found_emails)
+
+            # Buscar enlaces de contacto
+            contact_links = await page.evaluate('''
+                () => {
+                    const links = Array.from(document.querySelectorAll('a'));
+                    return links
+                        .filter(link => {
+                            const text = (link.textContent || '').toLowerCase();
+                            const href = (link.href || '').toLowerCase();
+                            return ['contact', 'kontakt', 'contacto', 'contacta', 'about', 'sobre', 'nosotros', 'empresa']
+                                .some(keyword => text.includes(keyword) || href.includes(keyword));
+                        })
+                        .map(link => link.href)
+                        .filter(href => href.startsWith('http'));
+                }
+            ''')
+
+            # Limitar enlaces de contacto
+            contact_links = contact_links[:MAX_CONTACT_LINKS]
+
+            # Extraer emails de páginas de contacto
+            for contact_url in contact_links:
+                if time.time() - start_time > MAX_TOTAL_TIME:
+                    break
+                try:
+                    await page.goto(contact_url, timeout=CONTACT_PAGE_TIMEOUT)
+                    await page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
+                    contact_content = await page.content()
+                    contact_emails = re.findall(email_pattern, contact_content)
+                    emails_found.update(contact_emails)
+                except Exception:
+                    continue
+
+        except Exception:
+            error_message = "Error"
+
+    finally:
+        if context:
+            await context.close()
+        if create_own_browser and browser:
+            await browser.close()
+
+    return {'emails': emails_found, 'error': error_message}
+
+
+async def extract_contact_info(url, business_name="", extraction_semaphore: asyncio.Semaphore = None,
+                               current_index=0, total_urls=0, browser=None) -> dict:
+    """Extrae información de contacto (emails) de una URL.
+
+    OPTIMIZACIÓN v2: Reutiliza el browser pasado como parámetro en lugar de
+    lanzar uno nuevo por cada URL. Esto ahorra ~500ms-2s por URL.
+
+    Args:
+        url: URL del negocio a procesar
+        business_name: Nombre del negocio (para logs)
+        extraction_semaphore: Semáforo para limitar concurrencia
+        current_index: Índice actual (para logs)
+        total_urls: Total de URLs (para logs)
+        browser: Browser Playwright compartido (NUEVO - optimización)
+    """
     if not url:
         return {"Email_Raw": "", "Email_Filtered": "", "Email_Search_Status": "No URL proporcionada"}
-    
+
     if extraction_semaphore is None:
         extraction_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
-    
+
     logging.info(f"[{current_index}/{total_urls}] Iniciando búsqueda en {url}")
     emails_found = set()
     error_message = ""
     start_time = time.time()
-    
+
     try:
         async with extraction_semaphore:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                try:
-                    context = await browser.new_context(
-                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            # OPTIMIZACIÓN: Reutilizar browser pasado en lugar de crear uno nuevo
+            if browser is None:
+                # Fallback: crear browser propio si no se pasó uno (compatibilidad)
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    result = await _extract_emails_with_browser(
+                        browser, url, start_time, emails_found, create_own_browser=True
                     )
-                    page = await context.new_page()
-                    
-                    # Intentar cargar la página principal
-                    try:
-                        await page.goto(url, timeout=MAIN_PAGE_TIMEOUT)
-                        await page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
-                        
-                        # Extraer emails del contenido HTML
-                        content = await page.content()
-                        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-                        found_emails = re.findall(email_pattern, content)
-                        emails_found.update(found_emails)
-                        
-                        # Buscar enlaces de contacto y extraer sus emails
-                        contact_links = await page.evaluate('''
-                            () => {
-                                const links = Array.from(document.querySelectorAll('a'));
-                                return links
-                                    .filter(link => {
-                                        const text = (link.textContent || '').toLowerCase();
-                                        const href = (link.href || '').toLowerCase();
-                                        return ['contact', 'kontakt', 'contacto', 'contacta', 'about', 'sobre', 'nosotros', 'empresa']
-                                            .some(keyword => text.includes(keyword) || href.includes(keyword));
-                                    })
-                                    .map(link => link.href)
-                                    .filter(href => href.startsWith('http'));
-                            }
-                        ''')
-                        
-                        # Limitar el número de enlaces de contacto a procesar
-                        contact_links = contact_links[:MAX_CONTACT_LINKS]
-                        
-                        # Intentar extraer emails de las páginas de contacto
-                        for contact_url in contact_links:
-                            # Verificar tiempo total
-                            if time.time() - start_time > MAX_TOTAL_TIME:
-                                break
-                                
-                            try:
-                                await page.goto(contact_url, timeout=CONTACT_PAGE_TIMEOUT)
-                                await page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
-                                contact_content = await page.content()
-                                contact_emails = re.findall(email_pattern, contact_content)
-                                emails_found.update(contact_emails)
-                            except:
-                                continue
-                    
-                    except Exception:
-                        error_message = "Error"
-                
-                finally:
-                    if context:
-                        await context.close()
-                    await browser.close()
-    
+                    emails_found = result['emails']
+                    error_message = result['error']
+            else:
+                # Reutilizar browser compartido - solo crear contexto
+                result = await _extract_emails_with_browser(
+                    browser, url, start_time, emails_found, create_own_browser=False
+                )
+                emails_found = result['emails']
+                error_message = result['error']
+
     except Exception:
         error_message = "Error"
     
@@ -775,11 +866,12 @@ async def scrape_google_maps_cell(query: str, cell_center: dict, fixed_zoom: int
         try:
             # Cargar cookies guardadas si existen (del --setup)
             storage_state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_data", "google_maps_state.json")
+            has_storage_state = os.path.exists(storage_state_file)
             context_kwargs = {
                 'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
                 'viewport': {'width': 1920, 'height': 1080}
             }
-            if os.path.exists(storage_state_file):
+            if has_storage_state:
                 context_kwargs['storage_state'] = storage_state_file
             context = await browser.new_context(**context_kwargs)
             page = await context.new_page()
@@ -793,68 +885,72 @@ async def scrape_google_maps_cell(query: str, cell_center: dict, fixed_zoom: int
             except Exception:
                 logging.debug("[Celda] Feed no encontrado tras 10s, continuando igualmente...")
             await page.wait_for_timeout(2000)
-            
-            # Manejo de cookies
-            cookie_selectors = [
-                "button:has-text('Accept all')",
-                "[aria-label='Accept all']",
-                "button:has-text('Aceptar todo')",
-                "[aria-label='Aceptar todo']",
-                "#L2AGLb",
-                "button:has-text('I agree')",
-                "[aria-label='I agree']",
-                "button:has-text('Agree')",
-                "[aria-label='Agree']"
-            ]
-            for selector in cookie_selectors:
-                try:
-                    cookie_button = await page.wait_for_selector(selector, timeout=500)
-                    if cookie_button:
-                        await cookie_button.click()
-                        logging.info("[Celda] Cookies aceptadas.")
-                        await page.wait_for_timeout(100)
-                        break
-                except Exception as e:
-                    logging.debug(f"[Celda] Selector {selector} no funcionó: {e}")
-                    continue
-            
+
+            # OPTIMIZACIÓN v2: Solo intentar aceptar cookies si NO hay storage_state guardado
+            # Esto ahorra ~4 segundos por celda (8 selectores × 500ms timeout)
+            if not has_storage_state:
+                cookie_selectors = [
+                    "button:has-text('Accept all')",
+                    "[aria-label='Accept all']",
+                    "button:has-text('Aceptar todo')",
+                    "[aria-label='Aceptar todo']",
+                    "#L2AGLb",
+                    "button:has-text('I agree')",
+                    "[aria-label='I agree']",
+                    "button:has-text('Agree')",
+                    "[aria-label='Agree']"
+                ]
+                for selector in cookie_selectors:
+                    try:
+                        cookie_button = await page.wait_for_selector(selector, timeout=500)
+                        if cookie_button:
+                            await cookie_button.click()
+                            logging.info("[Celda] Cookies aceptadas.")
+                            await page.wait_for_timeout(100)
+                            break
+                    except Exception as e:
+                        logging.debug(f"[Celda] Selector {selector} no funcionó: {e}")
+                        continue
+
             await page.wait_for_timeout(1000)
-            
-            # Script de scroll mejorado para obtener todos los resultados
-            scroll_script = """
-                async () => {
+
+            # Script de scroll OPTIMIZADO v2: timeouts reducidos de 2000ms a 1000ms
+            scroll_script = f"""
+                async () => {{
                     const container = document.querySelector(".m6QErb[role='feed']");
                     if (!container) return 0;
                     let lastHeight = container.scrollHeight;
                     let noNewResults = 0;
-                    const maxNoNewResults = 3;  // Número de intentos sin nuevos resultados antes de parar
-                    
-                    while (noNewResults < maxNoNewResults) {
+                    const maxNoNewResults = {MAX_NO_NEW_RESULTS};
+                    const scrollWait = {SCROLL_WAIT_MS};
+                    const retryWait = {SCROLL_RETRY_WAIT_MS};
+
+                    while (noNewResults < maxNoNewResults) {{
                         container.scrollTo(0, container.scrollHeight);
-                        await new Promise(resolve => setTimeout(resolve, 2000));
-                        
+                        await new Promise(resolve => setTimeout(resolve, scrollWait));
+
                         // Verificar si llegamos al final
-                        if (container.querySelector('.HlvSq')) {
+                        if (container.querySelector('.HlvSq')) {{
                             break;
-                        }
-                        
+                        }}
+
                         let newHeight = container.scrollHeight;
-                        if (newHeight === lastHeight) {
+                        if (newHeight === lastHeight) {{
                             noNewResults++;
-                            await new Promise(resolve => setTimeout(resolve, 2000));
+                            await new Promise(resolve => setTimeout(resolve, retryWait));
                             newHeight = container.scrollHeight;
-                            if (newHeight === lastHeight) {
+                            if (newHeight === lastHeight) {{
                                 noNewResults++;
-                            } else {
+                            }} else {{
                                 noNewResults = 0;
-                            }
-                        } else {
+                            }}
+                        }} else {{
                             noNewResults = 0;
-                        }
+                        }}
                         lastHeight = newHeight;
-                    }
+                    }}
                     return lastHeight;
-                }
+                }}
             """
             final_scroll_height = await page.evaluate(scroll_script)
             logging.info(f"[Celda] Scroll finalizado con altura: {final_scroll_height}")
@@ -1063,18 +1159,20 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
                 unique_results[key] = result
     
     final_results = list(unique_results.values())
-    
+
     # Crear semáforo para extracciones de email
     extraction_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
-    
+
     # Enriquecer cada resultado con extracción de emails
+    # OPTIMIZACIÓN v2: Pasar el browser compartido para evitar lanzar uno nuevo por URL
     enrichment_tasks = [
         extract_contact_info(
             result.get("Website", ""),
             business_name=result.get("Name", ""),
             extraction_semaphore=extraction_semaphore,
             current_index=i+1,
-            total_urls=len(final_results)
+            total_urls=len(final_results),
+            browser=browser  # Reutilizar browser para email extraction
         ) for i, result in enumerate(final_results)
     ]
     contact_infos = await asyncio.gather(*enrichment_tasks, return_exceptions=True)
@@ -1134,20 +1232,21 @@ async def process_city(city_data: dict, config: dict, browser, semaphore, proces
         
         if results:
             # Filtrar negocios usando el registro temporal
+            # OPTIMIZACIÓN v2: Usar lock compartido global
             new_results = []
-            async with asyncio.Lock():
+            async with _cache_lock:
                 for result in results:
                     business_id = get_business_id(result)
                     if business_id and business_id not in temp_processed_businesses:
                         new_results.append(result)
                         temp_processed_businesses.add(business_id)
-                
+
             if not new_results:
                 log_stats(f"[{city_name}]", "Sin resultados nuevos después del filtrado temporal")
                 return
 
             # Persist the updated full set of processed businesses immediately after adding new ones
-            async with asyncio.Lock():
+            async with _cache_lock:
                 processed_businesses.update(temp_processed_businesses)
                 try:
                     with open(cache_file, 'w', encoding='utf-8') as f:
@@ -1199,19 +1298,14 @@ async def process_city(city_data: dict, config: dict, browser, semaphore, proces
                 )
 
             # Procesar y guardar resultados con correos
+            # OPTIMIZACIÓN v2: Usar lock compartido y contador en memoria
             if not df_with_emails.empty:
-                async with asyncio.Lock():
-                    start_id = 1
-                    if os.path.exists(final_csv):
-                        try:
-                            existing_df = pd.read_csv(final_csv)
-                            if not existing_df.empty and 'ID' in existing_df.columns:
-                                start_id = existing_df['ID'].max() + 1
-                        except Exception:
-                            pass
-                    
+                async with _csv_write_lock:
+                    # Usar contador en memoria en lugar de leer CSV completo
+                    start_id = _csv_id_counters['with_emails'] + 1
                     df_with_emails['ID'] = range(start_id, start_id + len(df_with_emails))
-                    
+                    _csv_id_counters['with_emails'] = start_id + len(df_with_emails) - 1
+
                     text_columns = df_with_emails.select_dtypes(include=['object']).columns
                     for col in text_columns:
                         df_with_emails[col] = df_with_emails[col].astype(str).str.replace('nan', '', regex=False).str.replace('None', '', regex=False).str.replace('"', '""')
@@ -1226,20 +1320,15 @@ async def process_city(city_data: dict, config: dict, browser, semaphore, proces
                         doublequote=True
                     )
                     log_stats("Registros con correos guardados:", len(df_with_emails))
-            
+
             # Procesar y guardar resultados sin correos
             if not df_no_emails.empty:
-                async with asyncio.Lock():
-                    start_id = 1
-                    if os.path.exists(no_emails_csv):
-                        try:
-                            existing_df = pd.read_csv(no_emails_csv)
-                            if not existing_df.empty and 'ID' in existing_df.columns:
-                                start_id = existing_df['ID'].max() + 1
-                        except Exception:
-                            pass
+                async with _csv_write_lock:
+                    # Usar contador en memoria en lugar de leer CSV completo
+                    start_id = _csv_id_counters['no_emails'] + 1
                     df_no_emails['ID'] = range(start_id, start_id + len(df_no_emails))
-                    
+                    _csv_id_counters['no_emails'] = start_id + len(df_no_emails) - 1
+
                     text_columns = df_no_emails.select_dtypes(include=['object']).columns
                     for col in text_columns:
                         df_no_emails[col] = df_no_emails[col].astype(str).str.replace('nan', '', regex=False).str.replace('None', '', regex=False).str.replace('"', '""')
@@ -1256,7 +1345,8 @@ async def process_city(city_data: dict, config: dict, browser, semaphore, proces
                     log_stats("Registros sin correos guardados:", len(df_no_emails))
         
         # Actualizar checkpoint
-        async with asyncio.Lock():
+        # OPTIMIZACIÓN v2: Usar lock compartido global
+        async with _checkpoint_lock:
             processed_cities.add(city_name)
             try:
                 # Obtener stats actuales para guardarlas en el checkpoint
@@ -1357,6 +1447,8 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                             help='Modo batch/background: no pide input interactivo. Usa valores por defecto para lo no especificado.')
         parser.add_argument('--setup', action='store_true',
                             help='Configuración interactiva completa + verificación de Google Maps en navegador visible. Guarda todo para --continue.')
+        parser.add_argument('--reset-cookies', action='store_true', dest='reset_cookies',
+                            help='Elimina las cookies guardadas de Google Maps para reiniciar la sesión.')
         parser.add_argument('--continue-run', action='store_true', dest='continue_run',
                             help='Relanza el scraping en segundo plano usando la configuración guardada por --setup.')
         parser.add_argument('--run-id', type=str, dest='run_id',
@@ -1370,6 +1462,21 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
         os.makedirs(browser_data_dir, exist_ok=True)
         storage_state_path = os.path.join(browser_data_dir, "google_maps_state.json")
         setup_config_path = os.path.join(browser_data_dir, "setup_config.json")
+
+        # --- Modo --reset-cookies: eliminar cookies guardadas ---
+        if args.reset_cookies:
+            files_deleted = []
+            if os.path.exists(storage_state_path):
+                os.remove(storage_state_path)
+                files_deleted.append("cookies de Google Maps")
+
+            if files_deleted:
+                print(f"\n✓ Sesión reiniciada correctamente.")
+                print(f"  Eliminado: {', '.join(files_deleted)}")
+                print(f"\nEjecuta --setup para configurar una nueva sesión.")
+            else:
+                print("\nNo había cookies guardadas para eliminar.")
+            return
 
         # --- Modo --continue: relanzar con config guardada ---
         if args.continue_run:
@@ -1586,10 +1693,15 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
             print("  3. Cierra el navegador cuando termines\n")
 
             async with async_playwright() as p_setup:
-                setup_browser = await p_setup.chromium.launch(headless=False, args=['--lang=es-ES'])
+                # Usar viewport más pequeño para compatibilidad con laptops
+                # 1280x720 es un tamaño seguro que cabe en la mayoría de pantallas
+                setup_browser = await p_setup.chromium.launch(
+                    headless=False,
+                    args=['--lang=es-ES', '--window-size=1300,750']
+                )
                 setup_context = await setup_browser.new_context(
                     user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                    viewport={'width': 1920, 'height': 1080}
+                    viewport={'width': 1280, 'height': 720}
                 )
                 setup_page = await setup_context.new_page()
                 # Navegar con la query real del usuario
@@ -1749,6 +1861,25 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                         logging.warning(f"No se encontró archivo de caché {cache_file} asociado al checkpoint.")
 
                     resuming = True # Set resume flag to true
+
+                    # OPTIMIZACIÓN v2: Inicializar contadores de ID desde CSV existentes
+                    # para evitar leer el CSV completo en cada escritura
+                    if final_csv and os.path.exists(final_csv):
+                        try:
+                            with open(final_csv, 'r', encoding='utf-8') as f:
+                                line_count = sum(1 for _ in f) - 1  # -1 por header
+                            _csv_id_counters['with_emails'] = max(0, line_count)
+                            logging.info(f"  - Contador CSV con emails inicializado: {line_count}")
+                        except Exception:
+                            pass
+                    if no_emails_csv and os.path.exists(no_emails_csv):
+                        try:
+                            with open(no_emails_csv, 'r', encoding='utf-8') as f:
+                                line_count = sum(1 for _ in f) - 1
+                            _csv_id_counters['no_emails'] = max(0, line_count)
+                            logging.info(f"  - Contador CSV sin emails inicializado: {line_count}")
+                        except Exception:
+                            pass
 
                 except Exception as e:
                     logging.error(f"Error cargando checkpoint ({checkpoint_file}): {e}. No se pudo retomar.")
@@ -2487,6 +2618,13 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
 
     finally:
         # --- Final Cleanup --- #
+        # OPTIMIZACIÓN v2: Cerrar sesión aiohttp compartida
+        try:
+            await close_shared_session()
+            logging.debug("Sesión aiohttp compartida cerrada")
+        except Exception as e:
+            logging.debug(f"Error cerrando sesión aiohttp: {e}")
+
         # Stop control and stats threads
         if control_thread:
             control_thread.stop()

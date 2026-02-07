@@ -106,7 +106,19 @@ async def get_subdivisions_for_region(country_code: str, adm1_code: str, geoname
 
 
 class ScrapeManager:
-    """Interfaz curses para gestionar instancias del scraper."""
+    """Interfaz curses para gestionar instancias del scraper.
+
+    Optimizaciones v2:
+    - Refresh reducido a 500ms para menos I/O
+    - Cache de conteo de líneas CSV para evitar lecturas repetidas
+    """
+
+    # Configuración de refresh (en ms)
+    REFRESH_TIMEOUT_MS = 500  # Timeout de getch (antes 100ms)
+    SLEEP_BETWEEN_FRAMES = 0.0  # Sin sleep adicional (antes 0.05s)
+
+    # Cache para conteo de líneas CSV
+    CSV_LINE_CACHE_TTL = 5.0  # Segundos de validez del cache
 
     def __init__(self, stdscr):
         self.stdscr = stdscr
@@ -128,6 +140,9 @@ class ScrapeManager:
         self.csv_data = []  # Parsed CSV data for table view
         self.show_all_emails = False  # Toggle: False=corporativos, True=todos
 
+        # Cache para conteo de líneas CSV: {filepath: (mtime, count, cached_at)}
+        self._csv_line_cache = {}
+
         # Curses setup
         curses.curs_set(0)  # Hide cursor
         curses.start_color()
@@ -143,7 +158,7 @@ class ScrapeManager:
         curses.init_pair(7, curses.COLOR_RED, curses.COLOR_YELLOW)  # Warning
         curses.init_pair(8, curses.COLOR_WHITE, -1)   # Normal text
 
-        self.stdscr.timeout(100)  # Non-blocking getch with 100ms timeout
+        self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)  # Non-blocking getch optimizado
 
     def get_status_color(self, status: str) -> int:
         """Returns the color pair for a given status."""
@@ -427,10 +442,33 @@ class ScrapeManager:
             return "-"
 
     def count_csv_lines(self, filepath: str) -> int:
-        """Counts lines in a CSV file (excluding header)."""
+        """Counts lines in a CSV file (excluding header).
+
+        Usa cache con TTL para evitar lecturas repetidas.
+        El cache se invalida si el archivo ha cambiado (mtime).
+        """
+        now = time.time()
+
+        # Verificar cache
+        if filepath in self._csv_line_cache:
+            cached_mtime, cached_count, cached_at = self._csv_line_cache[filepath]
+            # Verificar TTL y mtime
+            if now - cached_at < self.CSV_LINE_CACHE_TTL:
+                try:
+                    current_mtime = os.path.getmtime(filepath)
+                    if current_mtime == cached_mtime:
+                        return cached_count
+                except OSError:
+                    pass
+
+        # Leer de disco
         try:
+            mtime = os.path.getmtime(filepath)
             with open(filepath, 'r', encoding='utf-8') as f:
-                return sum(1 for _ in f) - 1  # Exclude header
+                count = sum(1 for _ in f) - 1  # Exclude header
+            # Guardar en cache
+            self._csv_line_cache[filepath] = (mtime, count, now)
+            return count
         except:
             return 0
 
@@ -785,7 +823,7 @@ class ScrapeManager:
             else:
                 self.show_message("Kill cancelado")
         finally:
-            self.stdscr.timeout(100)
+            self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
 
     def prompt_workers(self, pid: int):
         """Prompts for new worker count, updates checkpoint, stops job and relaunches.
@@ -974,7 +1012,7 @@ class ScrapeManager:
         finally:
             curses.noecho()
             curses.curs_set(0)
-            self.stdscr.timeout(100)
+            self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
 
     def revive_job(self, job: Job):
         """Revives an interrupted job by launching a new process.
@@ -1086,7 +1124,7 @@ class ScrapeManager:
         curses.start_color()
         curses.use_default_colors()
         self.stdscr.keypad(True)
-        self.stdscr.timeout(100)
+        self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
 
     def new_scraping_wizard(self):
         """Interactive wizard to create and launch a new scraping job."""
@@ -1134,15 +1172,15 @@ class ScrapeManager:
                     cookies_valid, cookies_msg = self.check_cookies_valid()
                     if not cookies_valid:
                         self.show_message("Setup completado pero cookies aún no válidas. Inténtalo de nuevo.")
-                        self.stdscr.timeout(100)
+                        self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
                         return
                 elif key == ord('c') or key == ord('C'):
                     pass  # Continue anyway
                 else:
-                    self.stdscr.timeout(100)
+                    self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
                     return
             finally:
-                self.stdscr.timeout(100)
+                self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
 
         # Now show the new scraping form
         self.show_new_scraping_form()
@@ -1462,7 +1500,7 @@ class ScrapeManager:
 
                 if cancelled:
                     self.show_message("Cancelado")
-                    self.stdscr.timeout(100)
+                    self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
                     return
 
                 # Validate
@@ -1543,7 +1581,7 @@ class ScrapeManager:
 
                 if key == 27:  # Escape
                     self.show_message("Cancelado")
-                    self.stdscr.timeout(100)
+                    self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
                     return
                 elif key == ord('b') or key == ord('B'):
                     phase = 1
@@ -1625,7 +1663,7 @@ class ScrapeManager:
 
                 if key == 27:
                     self.show_message("Cancelado")
-                    self.stdscr.timeout(100)
+                    self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
                     return
                 elif key == ord('b') or key == ord('B'):
                     final_config['region_code'] = None
@@ -1700,7 +1738,7 @@ class ScrapeManager:
 
                 if key == 27:
                     self.show_message("Cancelado")
-                    self.stdscr.timeout(100)
+                    self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
                     return
                 elif key == ord('b') or key == ord('B'):
                     # Go back to appropriate phase
@@ -1719,7 +1757,7 @@ class ScrapeManager:
                     # Save config and launch
                     self.save_wizard_config(final_config)
                     self.launch_new_scraping(final_config)
-                    self.stdscr.timeout(100)
+                    self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
                     return
 
     def launch_new_scraping(self, config: dict):
@@ -1804,7 +1842,13 @@ class ScrapeManager:
             del self.pending_commands[pid]
 
     def run(self):
-        """Main loop."""
+        """Main loop.
+
+        Optimizado para reducir I/O:
+        - Timeout de getch en 500ms (antes 100ms)
+        - Sin sleep adicional entre frames
+        - El JobManager ya tiene cache con TTL
+        """
         while self.running:
             self.stdscr.clear()
 
@@ -1828,7 +1872,9 @@ class ScrapeManager:
             except curses.error:
                 pass
 
-            time.sleep(0.05)
+            # Sin sleep adicional - el timeout de getch ya controla la frecuencia
+            if self.SLEEP_BETWEEN_FRAMES > 0:
+                time.sleep(self.SLEEP_BETWEEN_FRAMES)
 
 
 def main(stdscr):
