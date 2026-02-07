@@ -376,9 +376,10 @@ El gestor tiene tres vistas principales:
 |-------|--------|-------------|
 | `P` | Pausar | Pausa la instancia seleccionada. El proceso espera sin consumir recursos. |
 | `R` | Reanudar | Reanuda una instancia pausada. |
-| `S` | Stop graceful | Envia senal de parada. El proceso termina la ciudad actual y para. |
+| `S` | Stop graceful | Envia senal de parada. El proceso termina el batch actual (cada 10 negocios) y para. |
 | `K` | Kill | Termina el proceso inmediatamente con SIGKILL. Util para procesos pausados. |
 | `W` | Workers | Cambia el numero de workers. Para el proceso y lo relanza con la nueva configuracion. |
+| `T` | Retry | Reinicia una ciudad atascada. Util cuando la busqueda en Maps no avanza. |
 | `F` | Files | Abre el visor de archivos con los resultados de la instancia seleccionada. |
 | `↑/↓` o `j/k` | Navegar | Mueve la seleccion entre instancias. |
 
@@ -409,7 +410,7 @@ El gestor tiene tres vistas principales:
 | Total | Total de resultados extraidos |
 | Emails | Resultados con email encontrado |
 | Runtime | Tiempo de ejecucion |
-| Ciudad Actual | Ciudad que se esta procesando actualmente |
+| Ciudades activas | Ciudades en proceso (una por worker activo) |
 
 ### Panel de detalles
 
@@ -425,6 +426,15 @@ Debajo de la lista de instancias se muestra informacion detallada de la instanci
 - **Con web**: Negocios con pagina web
 - **Errores**: Numero de errores durante la ejecucion
 - **ETA**: Tiempo estimado restante basado en la media por ciudad
+
+#### Progreso de ciudades activas
+
+Cuando hay workers procesando ciudades, el panel muestra el estado de cada una:
+
+- **Buscando en Maps**: Indicador animado mientras se buscan negocios en Google Maps
+- **Barra de progreso**: Una vez encontrados los negocios, muestra `[████░░░░░░] 45/100` con el progreso de extraccion de emails
+
+Si usas multiples workers, cada ciudad activa se muestra con su worker asignado y progreso individual.
 
 ### Cambio dinamico de workers
 
@@ -444,7 +454,17 @@ Los estados de comando (`PAUSING...`, `STOPPING...`, etc.) se muestran en la col
 
 ### Latencia de comandos
 
-Los comandos (pause, resume, stop) se envian via archivos en `cache/control/` y son leidos por el scraper cada ~1 segundo. Los cambios de estado se reflejan en la siguiente iteracion del worker.
+Los comandos (pause, resume, stop) se envian via archivos en `cache/control/` y son leidos por el scraper despues de cada batch de 10 negocios. Esto permite una respuesta granular: no tienes que esperar a que termine toda la ciudad, solo el batch actual.
+
+### Retry de ciudades atascadas
+
+Si una ciudad parece atascada (el indicador "Buscando en Maps..." no avanza durante mucho tiempo), puedes reiniciar su procesamiento:
+
+1. Pulsa `T` para activar el modo retry
+2. Si hay multiples ciudades activas, selecciona cual reiniciar
+3. El worker abandona la busqueda actual y vuelve a encolar la ciudad
+
+El retry solo afecta a la busqueda en Maps. Si la ciudad ya estaba extrayendo emails, el progreso se pierde para esa ciudad (las demas no se ven afectadas).
 
 ### Limpieza automatica
 
@@ -476,6 +496,32 @@ Las estadisticas de cada run (tiempo de ejecucion, resultados, etc.) se mantiene
 - Al retomar con `--resume`, las stats anteriores se recuperan y se suman a las nuevas
 - El tiempo de ejecucion mostrado es el tiempo real acumulado de scraping activo (no incluye pausas)
 
+### Parada granular y checkpoints
+
+El sistema responde a comandos PAUSE y STOP de forma granular:
+
+- **Checkpoint inmediato tras busqueda**: Cuando se encuentran negocios en Maps, se guarda checkpoint inmediatamente, antes de empezar la extraccion de emails. Esto evita perder el trabajo de busqueda si se para el proceso.
+- **Respuesta por batch**: Los comandos se procesan cada 10 negocios (un batch). No tienes que esperar a que termine toda la ciudad.
+- **Estado correcto al parar**: Si paras durante el procesamiento, el job queda marcado como `interrupted` (no `completed`), permitiendo retomarlo con `--resume`.
+
+### Guardado incremental de resultados
+
+Los resultados se guardan al CSV **inmediatamente despues de cada batch** (cada 10 negocios procesados), no al final de la ciudad:
+
+- **Sin perdida de datos**: Si se interrumpe el proceso, los batches ya guardados no se pierden.
+- **Resume seguro**: Al retomar con `--resume`, los negocios ya guardados en el CSV no se vuelven a procesar.
+- **Stats en tiempo real**: Las estadisticas se actualizan despues de cada batch guardado.
+
+### Estadisticas de emails
+
+Las estadisticas distinguen entre tipos de email:
+
+- **Emails**: Negocios con cualquier email encontrado (raw o corporativo). Coincide exactamente con las filas del CSV `results_*.csv`.
+- **Corporativos**: Negocios cuyo email coincide con el dominio de su web (ej: `info@empresa.com` para `empresa.com`).
+- **Solo web**: Negocios con pagina web pero sin email encontrado.
+
+Al hacer `--resume`, las stats se sincronizan automaticamente con el contenido real de los archivos CSV para evitar discrepancias.
+
 ## Notas importantes
 
 - **Primera ejecucion**: Siempre ejecuta `--setup` primero para aceptar cookies/verificaciones de Google Maps. Sin este paso, el scraping en modo headless no obtendra resultados.
@@ -483,6 +529,6 @@ Las estadisticas de cada run (tiempo de ejecucion, resultados, etc.) se mantiene
 - **Rate limiting**: Google Maps puede limitar las peticiones si se hacen demasiadas en poco tiempo. Usar pocos workers (1-2) es mas seguro.
 - **Deduplicacion**: El script deduplica automaticamente por nombre+direccion+telefono y por web+telefono. No genera duplicados aunque las celdas se solapen.
 - **Proteccion contra conflictos**: Si intentas lanzar una nueva ejecucion con la misma configuracion que un proceso activo, el script lo detecta y aborta para evitar corrupcion de datos.
-- **Interrupcion segura**: Puedes parar el proceso con `Ctrl+C` o `kill`. El checkpoint se guarda automaticamente y puedes retomar con `--resume --run-id {id}`.
+- **Interrupcion segura**: Puedes parar el proceso con `Ctrl+C`, `kill`, o desde el gestor con `S`. El proceso para despues del batch actual (cada 10 negocios), guarda checkpoint y puedes retomar con `--resume --run-id {id}`.
 - **Gestor de instancias**: Usa `scrape_manager.py` para controlar instancias en ejecucion sin interrumpir el scraping.
 - **GeoNames API**: Necesitas una cuenta gratuita en [geonames.org](https://www.geonames.org/login) para usar la API. El usuario por defecto es `gorkota`.

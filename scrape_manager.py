@@ -237,7 +237,7 @@ class ScrapeManager:
         height, width = self.stdscr.getmaxyx()
 
         if self.view_mode == "active":
-            help_text = " [N]uevo [P]ausar [R]esumir [S]top [K]ill [W]orkers [F]iles [1]Act [2]Hist [Q]uit "
+            help_text = " [N]uevo [P]ausar [R]esumir [S]top [K]ill [W]orkers [T]Retry [F]iles [1]Act [2]Hist [Q]uit "
         elif self.view_mode == "history":
             help_text = " [N]uevo [Enter]Revivir [D]eliminar [F]iles [1]Act [2]Hist [Q]uit "
         else:  # files
@@ -349,7 +349,10 @@ class ScrapeManager:
     def draw_instance_details_extended(self, instance: Instance, start_y: int):
         """Draws extended detailed info for the selected instance."""
         height, width = self.stdscr.getmaxyx()
-        if start_y >= height - 8:
+        num_workers = instance.config.get('workers', 1)
+        # Necesitamos más espacio si hay múltiples workers (2 líneas por worker)
+        min_space_needed = 8 + (num_workers * 2)
+        if start_y >= height - min_space_needed:
             return
 
         stats = instance.stats
@@ -371,8 +374,75 @@ class ScrapeManager:
         cities_remaining = stats.cities_total - stats.cities_processed
         progress_pct = (stats.cities_processed / stats.cities_total * 100) if stats.cities_total > 0 else 0
 
-        # Current city info
-        if stats.current_city:
+        # Ciudades activas con progreso granular (soporta múltiples workers)
+        active_cities = getattr(stats, 'active_cities', {}) or {}
+        num_workers = config.get('workers', 1)
+
+        if active_cities:
+            # Mostrar todas las ciudades activas (múltiples workers)
+            self.stdscr.attron(curses.A_BOLD)
+            self.stdscr.addstr(y, 4, f"Ciudades en proceso ({len(active_cities)} de {num_workers} workers):")
+            self.stdscr.attroff(curses.A_BOLD)
+            y += 1
+
+            for city_name, city_data in active_cities.items():
+                if y >= height - 10:  # Evitar overflow
+                    break
+                worker_id = city_data.get('worker_id', '?')
+                population = city_data.get('population', 0)
+                biz_total = city_data.get('businesses_total', 0)
+                biz_processed = city_data.get('businesses_processed', 0)
+                status = city_data.get('status', 'searching')
+
+                # Info de la ciudad
+                city_info = f"  W{worker_id}: {city_name}"
+                if population > 0:
+                    city_info += f" ({self.format_population(population)} hab)"
+                self.stdscr.addstr(y, 4, city_info[:width - 6])
+                y += 1
+
+                # Mostrar estado o barra de progreso
+                if status == 'searching':
+                    # Animación de búsqueda inicial
+                    search_dots = "." * ((int(time.time()) % 3) + 1)
+                    search_line = f"      └─ 🔍 Conectando a Maps{search_dots}"
+                    self.stdscr.attron(curses.color_pair(4))  # Cyan
+                    self.stdscr.addstr(y, 4, search_line[:width - 6])
+                    self.stdscr.attroff(curses.color_pair(4))
+                    y += 1
+                elif status == 'scrolling':
+                    # Scroll en progreso - mostrar resultados encontrados
+                    scroll_results = city_data.get('scroll_results', 0)
+                    search_dots = "." * ((int(time.time()) % 3) + 1)
+                    search_line = f"      └─ 🔍 Scroll en Maps{search_dots} ({scroll_results} encontrados)"
+                    self.stdscr.attron(curses.color_pair(4))  # Cyan
+                    self.stdscr.addstr(y, 4, search_line[:width - 6])
+                    self.stdscr.attroff(curses.color_pair(4))
+                    y += 1
+                elif status == 'opening_cards':
+                    # Abriendo fichas individuales
+                    cards_total = city_data.get('cards_total', 0)
+                    cards_opened = city_data.get('cards_opened', 0)
+                    scroll_results = city_data.get('scroll_results', 0)
+                    search_dots = "." * ((int(time.time()) % 3) + 1)
+                    search_line = f"      └─ 📋 Abriendo fichas{search_dots} {cards_opened}/{cards_total} (de {scroll_results} total)"
+                    self.stdscr.attron(curses.color_pair(6))  # Magenta
+                    self.stdscr.addstr(y, 4, search_line[:width - 6])
+                    self.stdscr.attroff(curses.color_pair(6))
+                    y += 1
+                elif biz_total > 0:
+                    # Barra de progreso de negocios (extracting)
+                    biz_pct = (biz_processed / biz_total * 100) if biz_total > 0 else 0
+                    mini_bar_width = 20
+                    mini_filled = int(mini_bar_width * biz_pct / 100)
+                    mini_bar = "▓" * mini_filled + "░" * (mini_bar_width - mini_filled)
+                    biz_line = f"      └─ [{mini_bar}] {biz_processed}/{biz_total} ({biz_pct:.0f}%)"
+                    self.stdscr.attron(curses.color_pair(2))  # Amarillo
+                    self.stdscr.addstr(y, 4, biz_line[:width - 6])
+                    self.stdscr.attroff(curses.color_pair(2))
+                    y += 1
+        elif stats.current_city:
+            # Fallback: mostrar ciudad única (1 worker o legacy)
             city_info = f"Ciudad actual: {stats.current_city}"
             if stats.current_city_population > 0:
                 city_info += f" ({self.format_population(stats.current_city_population)} hab)"
@@ -380,6 +450,28 @@ class ScrapeManager:
                 city_info += f" [{stats.current_city_index}/{stats.cities_total}]"
             self.stdscr.addstr(y, 4, city_info[:width - 6])
             y += 1
+
+            # Progreso granular dentro de la ciudad (negocios procesados)
+            if stats.current_city_businesses_total > 0:
+                biz_processed = stats.current_city_businesses_processed
+                biz_total = stats.current_city_businesses_total
+                biz_pct = (biz_processed / biz_total * 100) if biz_total > 0 else 0
+                mini_bar_width = 20
+                mini_filled = int(mini_bar_width * biz_pct / 100)
+                mini_bar = "▓" * mini_filled + "░" * (mini_bar_width - mini_filled)
+                biz_line = f"  └─ Negocios: [{mini_bar}] {biz_processed}/{biz_total} ({biz_pct:.0f}%)"
+                self.stdscr.attron(curses.color_pair(2))  # Amarillo
+                self.stdscr.addstr(y, 4, biz_line[:width - 6])
+                self.stdscr.attroff(curses.color_pair(2))
+                y += 1
+            else:
+                # Todavía buscando en Maps
+                search_dots = "." * ((int(time.time()) % 3) + 1)
+                search_line = f"  └─ 🔍 Buscando en Maps{search_dots}"
+                self.stdscr.attron(curses.color_pair(4))  # Cyan
+                self.stdscr.addstr(y, 4, search_line[:width - 6])
+                self.stdscr.attroff(curses.color_pair(4))
+                y += 1
 
         # Progress bar
         bar_width = min(40, width - 20)
@@ -737,6 +829,11 @@ class ScrapeManager:
                     self.show_message("No hay archivo de resultados disponible")
                 return
 
+            if key == ord('t') or key == ord('T'):
+                # Retry ciudad atascada
+                self.prompt_retry_city(selected_instance)
+                return
+
         # History view commands
         if self.view_mode == "history":
             jobs = self.job_manager.list_jobs()
@@ -824,6 +921,85 @@ class ScrapeManager:
                 self.show_message("Kill cancelado")
         finally:
             self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
+
+    def prompt_retry_city(self, instance: Instance):
+        """Permite seleccionar y reiniciar una ciudad atascada."""
+        height, width = self.stdscr.getmaxyx()
+        pid = instance.pid
+        stats = instance.stats
+        active_cities = getattr(stats, 'active_cities', {}) or {}
+
+        if not active_cities:
+            self.show_message("No hay ciudades en proceso para reiniciar")
+            return
+
+        city_names = list(active_cities.keys())
+
+        # Si solo hay una ciudad, preguntar directamente
+        if len(city_names) == 1:
+            city_to_retry = city_names[0]
+            self.stdscr.addstr(height - 3, 2, " " * (width - 4))
+            self.stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+            self.stdscr.addstr(height - 3, 2, f"¿Reiniciar '{city_to_retry}'? [s/N]: ")
+            self.stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+            self.stdscr.refresh()
+
+            self.stdscr.timeout(-1)
+            try:
+                confirm = self.stdscr.getch()
+                if confirm == ord('s') or confirm == ord('S'):
+                    self.send_retry_city(pid, city_to_retry)
+                else:
+                    self.show_message("Retry cancelado")
+            finally:
+                self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
+        else:
+            # Múltiples ciudades - mostrar menú
+            selected_city_idx = 0
+            self.stdscr.timeout(-1)
+            try:
+                while True:
+                    # Dibujar menú de ciudades
+                    self.stdscr.addstr(height - 4, 2, " " * (width - 4))
+                    self.stdscr.addstr(height - 3, 2, " " * (width - 4))
+                    self.stdscr.attron(curses.A_BOLD)
+                    self.stdscr.addstr(height - 4, 2, "Selecciona ciudad a reiniciar (↑/↓, Enter=OK, Esc=Cancelar):")
+                    self.stdscr.attroff(curses.A_BOLD)
+
+                    # Mostrar ciudades
+                    cities_str = ""
+                    for i, city in enumerate(city_names):
+                        if i == selected_city_idx:
+                            cities_str += f"[{city}] "
+                        else:
+                            cities_str += f" {city}  "
+                    self.stdscr.addstr(height - 3, 2, cities_str[:width - 4])
+                    self.stdscr.refresh()
+
+                    key = self.stdscr.getch()
+                    if key == 27:  # Esc
+                        self.show_message("Retry cancelado")
+                        break
+                    elif key == curses.KEY_LEFT or key == ord('h'):
+                        selected_city_idx = max(0, selected_city_idx - 1)
+                    elif key == curses.KEY_RIGHT or key == ord('l'):
+                        selected_city_idx = min(len(city_names) - 1, selected_city_idx + 1)
+                    elif key == ord('\n') or key == curses.KEY_ENTER or key == 10:
+                        city_to_retry = city_names[selected_city_idx]
+                        self.send_retry_city(pid, city_to_retry)
+                        break
+            finally:
+                self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
+
+    def send_retry_city(self, pid: int, city_name: str):
+        """Envía comando de retry para una ciudad específica."""
+        from job_manager import ControlCommand
+        self.show_message(f"Enviando RETRY para '{city_name}'...")
+
+        if self.job_manager.send_command(pid, ControlCommand.RETRY_CITY, value=city_name):
+            self.show_message(f"RETRY enviado para '{city_name}'. La ciudad se reiniciará.", 5.0)
+        else:
+            self.show_message(f"Error enviando RETRY para '{city_name}'")
 
     def prompt_workers(self, pid: int):
         """Prompts for new worker count, updates checkpoint, stops job and relaunches.
@@ -1018,33 +1194,56 @@ class ScrapeManager:
         """Revives an interrupted job by launching a new process.
 
         The old job entry is deleted from history to avoid duplicates.
-        Uses --run-id to resume the specific run if available.
+        - If checkpoint exists: uses --resume to continue from where it left off
+        - If no checkpoint: uses --batch with saved config to start fresh
         """
         script_dir = os.path.dirname(os.path.abspath(__file__))
         script_path = os.path.join(script_dir, "scrape_maps_interactive.py")
+        log_file = os.path.join(script_dir, "scrapping_background.log")
 
-        # Get run_id from job config
+        # Check if checkpoint exists
+        has_checkpoint = job.checkpoint_file and os.path.exists(job.checkpoint_file)
         run_id = job.config.get('run_id')
 
-        cmd_parts = [
-            sys.executable, script_path,
-            '--resume',
-            '--batch'
-        ]
-
-        # Add run_id if available
-        if run_id:
-            cmd_parts.extend(['--run-id', run_id])
-
-        log_file = os.path.join(script_dir, "scrapping_background.log")
+        if has_checkpoint:
+            # Resume from checkpoint
+            cmd_parts = [
+                sys.executable, script_path,
+                '--resume',
+                '--batch'
+            ]
+            if run_id:
+                cmd_parts.extend(['--run-id', run_id])
+            mode_msg = "retomando desde checkpoint"
+        else:
+            # Start fresh with saved config
+            config = job.config
+            cmd_parts = [
+                sys.executable, script_path,
+                '--batch',
+                '--country_code', config.get('country_code', 'US'),
+                '--query', config.get('query', ''),
+                '--min_population', str(config.get('min_population', 50000)),
+                '--strategy', config.get('strategy', 'simple'),
+                '--max_results', str(config.get('max_results', 300)),
+                '--workers', str(config.get('workers', 1)),
+            ]
+            if config.get('max_population'):
+                cmd_parts.extend(['--max_population', str(config['max_population'])])
+            if config.get('region_code'):
+                cmd_parts.extend(['--region_code', config['region_code']])
+            if config.get('adm2_code'):
+                cmd_parts.extend(['--adm2_code', config['adm2_code']])
+            mode_msg = "comenzando de cero (sin checkpoint)"
 
         try:
             with open(log_file, 'a') as lf:
                 lf.write(f"\n{'='*60}\n")
-                lf.write(f"Reviviendo job: {job.job_id}\n")
-                if run_id:
+                lf.write(f"Reviviendo job: {job.job_id} ({mode_msg})\n")
+                if run_id and has_checkpoint:
                     lf.write(f"Run ID: {run_id}\n")
                 lf.write(f"Timestamp: {datetime.now().isoformat()}\n")
+                lf.write(f"Command: {' '.join(cmd_parts)}\n")
                 lf.write(f"{'='*60}\n")
                 proc = subprocess.Popen(
                     cmd_parts,
@@ -1057,7 +1256,7 @@ class ScrapeManager:
             if self.selected_index > 0:
                 self.selected_index -= 1
 
-            self.show_message(f"Job revivido con PID {proc.pid}", 5.0)
+            self.show_message(f"Job revivido ({mode_msg}) PID {proc.pid}", 5.0)
         except Exception as e:
             self.show_message(f"Error reviviendo job: {e}")
 

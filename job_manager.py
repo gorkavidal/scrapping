@@ -40,6 +40,19 @@ class ControlCommand(str, Enum):
     RESUME = "resume"
     STOP = "stop"
     SET_WORKERS = "set_workers"
+    RETRY_CITY = "retry_city"  # Reiniciar ciudad atascada
+
+
+@dataclass
+class CityProgress:
+    """Progreso de una ciudad en proceso."""
+    name: str = ""
+    population: int = 0
+    index: int = 0  # Posición en la cola (1-based)
+    start_time: Optional[str] = None  # ISO timestamp
+    businesses_total: int = 0  # Negocios encontrados en Google Maps
+    businesses_processed: int = 0  # Negocios con email ya extraído
+    worker_id: int = 0  # ID del worker que la procesa
 
 
 @dataclass
@@ -52,6 +65,7 @@ class JobStats:
     results_with_corporate_email: int = 0
     results_with_web: int = 0
     runtime_seconds: float = 0
+    # Campos legacy para compatibilidad (usados cuando hay 1 worker)
     current_city: str = ""
     current_city_index: int = 0  # Posición actual (1-based)
     current_city_population: int = 0
@@ -59,6 +73,12 @@ class JobStats:
     last_city_duration: float = 0  # Segundos que tardó la última ciudad
     avg_city_duration: float = 0  # Media de segundos por ciudad
     errors_count: int = 0
+    # Progreso granular - legacy para 1 worker
+    current_city_businesses_total: int = 0  # Negocios encontrados en Google Maps
+    current_city_businesses_processed: int = 0  # Negocios con email ya extraído
+    # Nuevo: Diccionario de ciudades activas para múltiples workers
+    # Clave: nombre de ciudad, Valor: dict con progreso
+    active_cities: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -589,6 +609,7 @@ class ControlThread(threading.Thread):
         self.pause_flag = False
         self.stop_flag = False
         self.new_workers: Optional[int] = None
+        self.retry_city: Optional[str] = None  # Nombre de ciudad a reiniciar
 
         self._running = True
 
@@ -609,6 +630,9 @@ class ControlThread(threading.Thread):
                     elif command == ControlCommand.SET_WORKERS:
                         if isinstance(value, int) and value > 0:
                             self.new_workers = value
+                    elif command == ControlCommand.RETRY_CITY:
+                        if isinstance(value, str) and value:
+                            self.retry_city = value
             except Exception:
                 pass  # Ignorar errores de lectura
 
@@ -621,6 +645,12 @@ class ControlThread(threading.Thread):
         """Consume y retorna el nuevo número de workers, o None."""
         val = self.new_workers
         self.new_workers = None
+        return val
+
+    def consume_retry_city(self) -> Optional[str]:
+        """Consume y retorna el nombre de ciudad a reiniciar, o None."""
+        val = self.retry_city
+        self.retry_city = None
         return val
 
 
@@ -665,6 +695,49 @@ class StatsThread(threading.Thread):
         """Actualiza el estado."""
         with self._lock:
             self.status = status
+
+    def add_active_city(self, city_name: str, worker_id: int, population: int = 0, index: int = 0):
+        """Añade una ciudad al diccionario de ciudades activas."""
+        with self._lock:
+            self.stats.active_cities[city_name] = {
+                'worker_id': worker_id,
+                'population': population,
+                'index': index,
+                'start_time': datetime.now().isoformat(),
+                'businesses_total': 0,
+                'businesses_processed': 0,
+                'status': 'searching',  # searching | scrolling | opening_cards | extracting
+                # Campos para fase de búsqueda en Maps
+                'scroll_results': 0,  # Resultados encontrados durante scroll
+                'cards_total': 0,  # Total de fichas que necesitan abrirse
+                'cards_opened': 0,  # Fichas ya abiertas
+            }
+
+    def update_city_progress(self, city_name: str, businesses_total: int = None,
+                            businesses_processed: int = None, status: str = None,
+                            scroll_results: int = None, cards_total: int = None,
+                            cards_opened: int = None):
+        """Actualiza el progreso de una ciudad activa."""
+        with self._lock:
+            if city_name in self.stats.active_cities:
+                if businesses_total is not None:
+                    self.stats.active_cities[city_name]['businesses_total'] = businesses_total
+                if businesses_processed is not None:
+                    self.stats.active_cities[city_name]['businesses_processed'] = businesses_processed
+                if status is not None:
+                    self.stats.active_cities[city_name]['status'] = status
+                if scroll_results is not None:
+                    self.stats.active_cities[city_name]['scroll_results'] = scroll_results
+                if cards_total is not None:
+                    self.stats.active_cities[city_name]['cards_total'] = cards_total
+                if cards_opened is not None:
+                    self.stats.active_cities[city_name]['cards_opened'] = cards_opened
+
+    def remove_active_city(self, city_name: str):
+        """Elimina una ciudad del diccionario de ciudades activas."""
+        with self._lock:
+            if city_name in self.stats.active_cities:
+                del self.stats.active_cities[city_name]
 
     def run(self):
         while self._running:

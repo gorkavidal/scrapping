@@ -138,10 +138,10 @@ DEFAULT_WORKERS = 1              # Workers por defecto
 
 # Configuración de límites de búsqueda de emails
 MAX_CONTACT_LINKS = 3            # Máx enlaces de contacto por URL principal
-MAX_TOTAL_TIME = 30              # Tiempo máx en segundos por URL
-MAIN_PAGE_TIMEOUT = 15000        # Timeout ms para página principal
+MAX_TOTAL_TIME = 20              # Tiempo máx en segundos por URL (reducido de 30)
+MAIN_PAGE_TIMEOUT = 8000         # Timeout ms para página principal (reducido de 15000)
 CONTACT_PAGE_TIMEOUT = 10000     # Timeout ms para páginas de contacto
-NETWORKIDLE_TIMEOUT = 5000       # Timeout ms para networkidle
+NETWORKIDLE_TIMEOUT = 3000       # Timeout ms para networkidle (reducido de 5000)
 
 # Timeouts de scroll optimizados (reducidos de 2000ms a 1000ms)
 SCROLL_WAIT_MS = 1000            # Espera entre scrolls (antes 2000)
@@ -701,29 +701,30 @@ async def _extract_emails_http(url: str, start_time: float) -> dict:
             html_lower = html.lower()
 
             # Detectar si es una SPA (Single Page App) que NECESITA JavaScript
-            # Solo marcamos is_spa=True si hay indicadores FUERTES de que el contenido
-            # está vacío y depende de JS para renderizar
-            spa_indicators = [
-                # Contenedor vacío típico de SPAs
-                '<div id="root"></div>',
-                '<div id="app"></div>',
-                '<div id="__next"></div>',
-                # Mensajes explícitos
-                'please enable javascript',
-                'javascript is required',
-                'you need to enable javascript',
-                'this site requires javascript',
-            ]
+            # Criterio MUY estricto: solo marcar como SPA si:
+            # 1. Casi no hay texto visible (<100 chars)
+            # 2. Hay indicadores EXPLÍCITOS de que requiere JS
+            # (La mayoría de webs con poco contenido simplemente no tienen emails)
 
-            # Indicadores de contenido real (si hay texto visible, no es una SPA vacía)
             soup = BeautifulSoup(html, 'html.parser')
             # Eliminar scripts y styles para contar texto real
             for tag in soup(['script', 'style', 'noscript']):
                 tag.decompose()
             visible_text = soup.get_text(separator=' ', strip=True)
 
-            # Si hay poco texto visible (<200 chars) y hay indicadores SPA, es SPA
-            is_spa = len(visible_text) < 200 and any(ind in html_lower for ind in spa_indicators)
+            # Indicadores EXPLÍCITOS de que la página requiere JavaScript
+            js_required_indicators = [
+                'please enable javascript',
+                'javascript is required',
+                'you need to enable javascript',
+                'this site requires javascript',
+                'enable javascript to view',
+                'javascript must be enabled',
+            ]
+
+            # Solo es SPA si: casi vacía (<100 chars) Y mensaje explícito de JS requerido
+            has_js_required_msg = any(ind in html_lower for ind in js_required_indicators)
+            is_spa = len(visible_text) < 100 and has_js_required_msg
 
             # La página se cargó correctamente si hay contenido real
             page_loaded = len(visible_text) > 100
@@ -1049,12 +1050,42 @@ def get_business_id(business: dict) -> str:
     key = "|".join(key_components)
     return hashlib.md5(key.encode()).hexdigest()
 
-async def scrape_google_maps_cell(query: str, cell_center: dict, fixed_zoom: int, max_results: int, browser, semaphore: asyncio.Semaphore, visited_places: set = None) -> list:
+async def scrape_google_maps_cell(query: str, cell_center: dict, fixed_zoom: int, max_results: int, browser, semaphore: asyncio.Semaphore, visited_places: set = None, control_thread=None, city_name: str = "", stats_thread=None) -> tuple:
+    """
+    Extrae negocios de una celda de Google Maps.
+
+    Returns:
+        tuple: (results: list, was_interrupted: bool)
+    """
     if visited_places is None:
         visited_places = set()
-    
+
     # Crear un conjunto local para esta celda
     local_visited = set()
+
+    # Helper para verificar si hay que parar inmediatamente
+    def should_stop_immediately() -> bool:
+        if control_thread is None:
+            return False
+        # STOP global afecta a todos los workers
+        if control_thread.stop_flag:
+            return True
+        # RETRY solo afecta a esta ciudad específica
+        if control_thread.retry_city == city_name:
+            return True
+        return False
+
+    # Helper para actualizar progreso de búsqueda
+    def update_search_progress(status: str = None, scroll_results: int = None,
+                               cards_total: int = None, cards_opened: int = None):
+        if stats_thread and city_name:
+            stats_thread.update_city_progress(
+                city_name=city_name,
+                status=status,
+                scroll_results=scroll_results,
+                cards_total=cards_total,
+                cards_opened=cards_opened
+            )
     
     lat = cell_center["center_lat"]
     lon = cell_center["center_lon"]
@@ -1115,47 +1146,73 @@ async def scrape_google_maps_cell(query: str, cell_center: dict, fixed_zoom: int
 
             await page.wait_for_timeout(1000)
 
-            # Script de scroll OPTIMIZADO v2: timeouts reducidos de 2000ms a 1000ms
-            scroll_script = f"""
-                async () => {{
-                    const container = document.querySelector(".m6QErb[role='feed']");
-                    if (!container) return 0;
-                    let lastHeight = container.scrollHeight;
-                    let noNewResults = 0;
-                    const maxNoNewResults = {MAX_NO_NEW_RESULTS};
-                    const scrollWait = {SCROLL_WAIT_MS};
-                    const retryWait = {SCROLL_RETRY_WAIT_MS};
+            # === SCROLL INCREMENTAL CON VERIFICACIÓN DE INTERRUPCIÓN ===
+            # En lugar de un script JS monolítico, hacemos scrolls desde Python
+            # para poder verificar interrupción entre cada uno
+            last_height = 0
+            no_new_results = 0
+            scroll_interrupted = False
 
-                    while (noNewResults < maxNoNewResults) {{
-                        container.scrollTo(0, container.scrollHeight);
-                        await new Promise(resolve => setTimeout(resolve, scrollWait));
+            # Actualizar estado a "scrolling"
+            update_search_progress(status='scrolling', scroll_results=0)
 
-                        // Verificar si llegamos al final
-                        if (container.querySelector('.HlvSq')) {{
-                            break;
-                        }}
+            while no_new_results < MAX_NO_NEW_RESULTS:
+                # === VERIFICAR INTERRUPCIÓN ANTES DE CADA SCROLL ===
+                if should_stop_immediately():
+                    logging.info(f"[Celda] Interrupción solicitada durante scroll para {city_name}")
+                    scroll_interrupted = True
+                    break
 
-                        let newHeight = container.scrollHeight;
-                        if (newHeight === lastHeight) {{
-                            noNewResults++;
-                            await new Promise(resolve => setTimeout(resolve, retryWait));
-                            newHeight = container.scrollHeight;
-                            if (newHeight === lastHeight) {{
-                                noNewResults++;
-                            }} else {{
-                                noNewResults = 0;
-                            }}
-                        }} else {{
-                            noNewResults = 0;
-                        }}
-                        lastHeight = newHeight;
-                    }}
-                    return lastHeight;
-                }}
-            """
-            final_scroll_height = await page.evaluate(scroll_script)
-            logging.info(f"[Celda] Scroll finalizado con altura: {final_scroll_height}")
-            
+                # Ejecutar un único scroll y obtener estado + conteo de resultados
+                # Timeout de 5s para evitar bloqueos indefinidos
+                try:
+                    scroll_result = await asyncio.wait_for(
+                        page.evaluate('''
+                            () => {
+                                const container = document.querySelector(".m6QErb[role='feed']");
+                                if (!container) return { height: 0, reachedEnd: true, count: 0 };
+                                container.scrollTo(0, container.scrollHeight);
+                                const reachedEnd = !!container.querySelector('.HlvSq');
+                                const cards = document.querySelectorAll('.Nv2PK');
+                                return { height: container.scrollHeight, reachedEnd: reachedEnd, count: cards.length };
+                            }
+                        '''),
+                        timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    logging.warning(f"[Celda] Timeout en scroll para {city_name}, verificando stop...")
+                    if should_stop_immediately():
+                        scroll_interrupted = True
+                        break
+                    # Continuar con valores por defecto
+                    scroll_result = {'height': last_height, 'reachedEnd': False, 'count': 0}
+
+                current_height = scroll_result.get('height', 0)
+                reached_end = scroll_result.get('reachedEnd', False)
+                current_count = scroll_result.get('count', 0)
+
+                # Actualizar progreso con el conteo actual
+                update_search_progress(scroll_results=current_count)
+
+                if reached_end:
+                    logging.debug(f"[Celda] Llegamos al final del feed ({current_count} resultados)")
+                    break
+
+                if current_height == last_height:
+                    no_new_results += 1
+                else:
+                    no_new_results = 0
+                    last_height = current_height
+
+                # Esperar entre scrolls usando asyncio.sleep para poder ser cancelado
+                await asyncio.sleep(SCROLL_WAIT_MS / 1000.0)
+
+            if scroll_interrupted:
+                await context.close()
+                return ([], True)
+
+            logging.info(f"[Celda] Scroll finalizado con altura: {last_height}")
+
             # Extracción inicial de datos
             initial_results = await page.evaluate('''
                 () => {
@@ -1182,23 +1239,37 @@ async def scrape_google_maps_cell(query: str, cell_center: dict, fixed_zoom: int
                         });
                         const address = possibleAddresses.length > 0 ? possibleAddresses[0] : "";
                         
-                        // Buscar el sitio web en el listado principal
+                        // Buscar el sitio web en el listado principal (múltiples estrategias)
                         let website = "";
-                        
-                        // 1. Buscar por data-value
-                        const websiteLink = card.querySelector('a[data-value="Website"], a[data-value="Sitio web"]');
-                        if (websiteLink) {
-                            website = websiteLink.href;
+
+                        // 1. Buscar por data-item-id="authority" (selector más fiable)
+                        const authorityLink = card.querySelector('a[data-item-id="authority"]');
+                        if (authorityLink) {
+                            website = authorityLink.href;
                         }
-                        
-                        // 2. Si no se encontró, buscar por clase lcr4fd
+
+                        // 2. Buscar por data-value
                         if (!website) {
-                            const links = card.querySelectorAll('a.lcr4fd');
-                            links.forEach(link => {
-                                const ariaLabel = link.getAttribute('aria-label') || '';
-                                if (ariaLabel.toLowerCase().includes('website') || 
-                                    ariaLabel.toLowerCase().includes('sitio web')) {
-                                    website = link.href;
+                            const websiteLink = card.querySelector('a[data-value="Website"], a[data-value="Sitio web"]');
+                            if (websiteLink) {
+                                website = websiteLink.href;
+                            }
+                        }
+
+                        // 3. Buscar links externos (no google.com/maps)
+                        if (!website) {
+                            const allLinks = card.querySelectorAll('a[href]');
+                            allLinks.forEach(link => {
+                                if (website) return; // Ya encontrado
+                                const href = link.href || '';
+                                // Excluir links de Google Maps
+                                if (href && !href.includes('google.com/maps') &&
+                                    !href.startsWith('javascript:') &&
+                                    (href.startsWith('http://') || href.startsWith('https://'))) {
+                                    // Verificar que no es un link interno de Google
+                                    if (!href.includes('google.com') && !href.includes('goo.gl')) {
+                                        website = href;
+                                    }
                                 }
                             });
                         }
@@ -1226,27 +1297,67 @@ async def scrape_google_maps_cell(query: str, cell_center: dict, fixed_zoom: int
                 }
             ''')
             
-            logging.info(f"Número de resultados en el listado: {len(initial_results)}")
+            # Estadísticas de extracción
+            with_website = sum(1 for r in initial_results if r.get("Website"))
+            without_website = len(initial_results) - with_website
+            logging.info(f"Número de resultados en el listado: {len(initial_results)} ({with_website} con web directa, {without_website} requieren ficha)")
+
+            # Actualizar estado: ahora abriendo fichas
+            if without_website > 0:
+                update_search_progress(status='opening_cards', cards_total=without_website, cards_opened=0)
+
             # Procesar cada resultado y abrir la ficha solo si es necesario
             final_results = []
+            was_interrupted = False
+            cards_opened_count = 0
+
+            # === TIMEOUT ADAPTATIVO PARA FICHAS ===
+            # Empezamos con timeout bajo y aumentamos si hay fallos por timeout
+            CARD_TIMEOUTS = [1500, 2500, 4000, 5000]  # Escalera de timeouts en ms
+            current_timeout_idx = 0  # Empezamos con el más bajo
+            consecutive_successes = 0  # Éxitos consecutivos para bajar timeout
+            consecutive_timeouts = 0  # Timeouts consecutivos para subir
+
             for result in initial_results:
+                # === VERIFICACIÓN DE INTERRUPCIÓN EN CADA FICHA ===
+                if should_stop_immediately():
+                    logging.info(f"[Celda] Interrupción solicitada durante procesamiento de fichas para {city_name}")
+                    was_interrupted = True
+                    break
+
                 # Crear una clave única para este lugar
                 business_id = get_business_id(result)
-                
+
                 # Si no se pudo generar un ID válido o ya está visitado, saltarlo
                 if not business_id or business_id in local_visited or business_id in visited_places:
                     continue
-                
+
                 # Marcar como visitado tanto localmente como globalmente
                 local_visited.add(business_id)
                 visited_places.add(business_id)
-                
+
                 if not result.get("Website") and result.get("PlaceUrl"):
+                    card_timeout = CARD_TIMEOUTS[current_timeout_idx]
+
                     try:
-                        logging.debug(f"[Celda] Abriendo ficha para: {result['Name']} (no se encontró sitio web en listado)")
-                        await page.goto(result["PlaceUrl"])
-                        # Changed wait condition: wait for the specific website button selector
-                        await page.wait_for_selector('a[data-item-id="authority"]', timeout=5000) 
+                        logging.debug(f"[Celda] Abriendo ficha para: {result['Name']} (timeout={card_timeout}ms)")
+
+                        # Usar timeout nativo de Playwright (no asyncio.wait_for que no funciona bien con Playwright)
+                        await page.goto(result["PlaceUrl"], timeout=card_timeout + 2000)  # +2s extra para navegación
+
+                        # Verificar stop inmediatamente después de goto
+                        if should_stop_immediately():
+                            logging.info(f"[Celda] Stop detectado después de goto para {city_name}")
+                            was_interrupted = True
+                            break
+
+                        await page.wait_for_selector('a[data-item-id="authority"]', timeout=card_timeout)
+
+                        # Verificar stop inmediatamente después de wait_for_selector
+                        if should_stop_immediately():
+                            logging.info(f"[Celda] Stop detectado después de wait_for_selector para {city_name}")
+                            was_interrupted = True
+                            break
 
                         logging.debug(f"[Celda] Intentando evaluar website para {result['Name']}")
                         # Extraer website de la ficha
@@ -1255,124 +1366,220 @@ async def scrape_google_maps_cell(query: str, cell_center: dict, fixed_zoom: int
                                 const websiteButton = document.querySelector('a[data-item-id="authority"]');
                                 return websiteButton ? websiteButton.href : "";
                             }
-                        ''') # Removed timeout=3000 argument
+                        ''')
                         logging.debug(f"[Celda] Resultado de evaluate para {result['Name']}: {website}")
                         if website:
                             result["Website"] = website
                             logging.info(f"[Celda] Sitio web encontrado en ficha para {result['Name']}: {website}")
                         else:
                             logging.info(f"[Celda] No se encontró sitio web en ficha para {result['Name']}")
+
+                        # Éxito - considerar bajar el timeout si llevamos varios éxitos
+                        consecutive_successes += 1
+                        consecutive_timeouts = 0
+                        if consecutive_successes >= 5 and current_timeout_idx > 0:
+                            current_timeout_idx -= 1
+                            consecutive_successes = 0
+                            logging.debug(f"[Celda] Bajando timeout a {CARD_TIMEOUTS[current_timeout_idx]}ms tras 5 éxitos")
+
                     except Exception as e:
-                        # Changed level to warning and improved message
+                        # Verificar stop también en excepciones
+                        if should_stop_immediately():
+                            logging.info(f"[Celda] Stop detectado durante excepción en ficha para {city_name}")
+                            was_interrupted = True
+                            break
+
+                        error_str = str(e).lower()
+                        if 'timeout' in error_str:
+                            consecutive_timeouts += 1
+                            consecutive_successes = 0
+
+                            # Subir timeout si hay fallos consecutivos
+                            if consecutive_timeouts >= 2 and current_timeout_idx < len(CARD_TIMEOUTS) - 1:
+                                current_timeout_idx += 1
+                                consecutive_timeouts = 0
+                                logging.debug(f"[Celda] Subiendo timeout a {CARD_TIMEOUTS[current_timeout_idx]}ms tras 2 timeouts")
+                        else:
+                            consecutive_successes = 0
                         logging.debug(f"[Celda] Error al procesar ficha para {result['Name']}: {e}")
-                
+
+                    # Actualizar contador de fichas abiertas
+                    cards_opened_count += 1
+                    update_search_progress(cards_opened=cards_opened_count)
+
+                # Si fue interrumpido durante la apertura de ficha, salir del bucle
+                if was_interrupted:
+                    break
+
                 # Eliminar PlaceUrl antes de añadir al resultado final
                 if "PlaceUrl" in result:
                     del result["PlaceUrl"]
                 final_results.append(result)
-            
+
             await context.close()
-            return final_results
+            return (final_results, was_interrupted)
         except Exception as e:
             logging.error(f"[Celda] Error en scrape_google_maps_cell: {e}")
-            return []
+            return ([], False)
 
 # -----------------------------------------------------
 # 5. Scraping de una ciudad
 # -----------------------------------------------------
 
-async def scrape_city(city_data: dict, query: str, max_results: int, browser, semaphore, country_code: str, strategy: str = "simple") -> list:
+async def scrape_city(city_data: dict, query: str, max_results: int, browser, semaphore, country_code: str, strategy: str = "simple",
+                      checkpoint_file: str = None, config: dict = None, processed_cities: set = None,
+                      final_csv: str = None, no_emails_csv: str = None, stats_thread=None,
+                      control_thread=None, processed_businesses: set = None, temp_processed_businesses: set = None) -> tuple:
     city_name = city_data['name']
     population = city_data.get('population', 0) # Use get with default
-    
-    logging.info(f"Procesando: {city_name} ({population:,} habitantes)")
-    # Pass city_data to potentially use its coordinates
-    loc = await get_city_location(city_name, country_code, city_data) 
-    if not loc:
-        logging.warning(f"No se pudo obtener la ubicación de {city_name}")
-        return []
-    
-    # Conjunto para mantener registro de fichas visitadas
-    visited_places = set()
-    
-    # Configuración según estrategia
-    if strategy == "simple":
-        # Estrategia actual: una celda con tamaño variable
-        if population > 500000:
-            grid_size = 1
-            cell_size_m = 2500   # 2.5 km por celda
-            fixed_zoom = 11
-        elif population >= 40000:
-            grid_size = 1
-            cell_size_m = 2000   # 2 km por celda
-            fixed_zoom = 12
-        else:
-            grid_size = 1
-            cell_size_m = 1500   # 1.5 km por celda
-            fixed_zoom = 12
-    else:
-        # Estrategia de cuadrícula del otro archivo
-        if population > 500000:
-            grid_size = 3
-            cell_size_m = 2500   # 2.5 km por celda
-            fixed_zoom = 15
-        elif population >= 40000:
-            grid_size = 2
-            cell_size_m = 2000   # 2 km por celda
-            fixed_zoom = 15
-        else:
-            grid_size = 1
-            cell_size_m = 1500   # 1.5 km por celda
-            fixed_zoom = 15
-
-    grid_cells = generate_grid_cells(
-        {"center_lat": loc["center_lat"], "center_lon": loc["center_lon"]}, 
-        grid_size, 
-        cell_size_m,
-        strategy
-    )
-    
-    search_query = f"{query} {city_name}"
-    
-    cell_tasks = [
-        scrape_google_maps_cell(search_query, cell, fixed_zoom, max_results, browser, semaphore, visited_places)
-        for cell in grid_cells
-    ]
-    cell_results_list = await asyncio.gather(*cell_tasks, return_exceptions=True)
-    city_results = []
-    for cell_result in cell_results_list:
-        if isinstance(cell_result, list):
-            city_results.extend(cell_result)
-    
-    # Primer deduplicado basado en el nombre y dirección antes de procesar sitios web
-    unique_results = {}
-    for result in city_results:
-        if result.get("Name"):
-            key = (
-                result.get("Name", "").strip(),
-                result.get("Address", "").strip(),
-                result.get("Phone", "").strip()
-            )
-            if key not in unique_results:
-                unique_results[key] = result
-            elif not unique_results[key].get("Website") and result.get("Website"):
-                # Si ya existe pero no tiene sitio web y el nuevo sí, actualizamos
-                unique_results[key] = result
-    
-    final_results = list(unique_results.values())
 
     # ==========================================================================
-    # CHECKPOINT GRANULAR: Guardar estado de ciudad para poder resumir
+    # CHECKPOINT GRANULAR: Verificar si hay estado guardado para esta ciudad
+    # Si existe, usar los negocios del checkpoint en lugar de hacer nueva búsqueda
     # ==========================================================================
-
-    # Guardar negocios encontrados en estado global (para checkpoint)
+    resuming_city = False
+    saved_final_results = None
     async with _city_state_lock:
-        _current_city_state['city_name'] = city_name
-        _current_city_state['raw_businesses'] = final_results
-        # Mantener processed_indices y enriched_results si estamos resumiendo
-        if _current_city_state.get('city_name') != city_name:
+        if (_current_city_state.get('city_name') == city_name and
+            _current_city_state.get('raw_businesses') and
+            len(_current_city_state.get('processed_indices', set())) > 0):
+            # Tenemos estado guardado con progreso - usar negocios del checkpoint
+            saved_final_results = _current_city_state['raw_businesses']
+            processed_count = len(_current_city_state['processed_indices'])
+            total_count = len(saved_final_results)
+            logging.info(f"Resumiendo ciudad: {city_name} ({processed_count}/{total_count} negocios ya procesados)")
+            resuming_city = True
+
+    # Si estamos resumiendo, usar los negocios guardados; si no, buscar nuevos
+    if resuming_city:
+        final_results = saved_final_results
+    else:
+        logging.info(f"Procesando: {city_name} ({population:,} habitantes)")
+        # Pass city_data to potentially use its coordinates
+        loc = await get_city_location(city_name, country_code, city_data)
+        if not loc:
+            logging.warning(f"No se pudo obtener la ubicación de {city_name}")
+            return ([], False, False)  # (results, interrupted=False, retry=False)
+
+        # Conjunto para mantener registro de fichas visitadas
+        visited_places = set()
+
+        # Configuración según estrategia
+        if strategy == "simple":
+            # Estrategia actual: una celda con tamaño variable
+            if population > 500000:
+                grid_size = 1
+                cell_size_m = 2500   # 2.5 km por celda
+                fixed_zoom = 11
+            elif population >= 40000:
+                grid_size = 1
+                cell_size_m = 2000   # 2 km por celda
+                fixed_zoom = 12
+            else:
+                grid_size = 1
+                cell_size_m = 1500   # 1.5 km por celda
+                fixed_zoom = 12
+        else:
+            # Estrategia de cuadrícula del otro archivo
+            if population > 500000:
+                grid_size = 3
+                cell_size_m = 2500   # 2.5 km por celda
+                fixed_zoom = 15
+            elif population >= 40000:
+                grid_size = 2
+                cell_size_m = 2000   # 2 km por celda
+                fixed_zoom = 15
+            else:
+                grid_size = 1
+                cell_size_m = 1500   # 1.5 km por celda
+                fixed_zoom = 15
+
+        grid_cells = generate_grid_cells(
+            {"center_lat": loc["center_lat"], "center_lon": loc["center_lon"]},
+            grid_size,
+            cell_size_m,
+            strategy
+        )
+
+        search_query = f"{query} {city_name}"
+
+        # === VERIFICAR STOP ANTES DE EMPEZAR CELDAS ===
+        if control_thread and control_thread.stop_flag:
+            logging.info(f"{city_name}: Stop solicitado antes de buscar en Maps")
+            return ([], True, False)  # (results, interrupted=True, retry=False)
+
+        cell_tasks = [
+            scrape_google_maps_cell(
+                search_query, cell, fixed_zoom, max_results, browser, semaphore, visited_places,
+                control_thread=control_thread, city_name=city_name, stats_thread=stats_thread
+            )
+            for cell in grid_cells
+        ]
+        cell_results_list = await asyncio.gather(*cell_tasks, return_exceptions=True)
+
+        # Verificar si alguna celda fue interrumpida
+        any_cell_interrupted = False
+        city_results = []
+        for cell_result in cell_results_list:
+            if isinstance(cell_result, tuple) and len(cell_result) == 2:
+                results, was_interrupted = cell_result
+                if was_interrupted:
+                    any_cell_interrupted = True
+                city_results.extend(results)
+            elif isinstance(cell_result, list):
+                # Compatibilidad con resultados legacy
+                city_results.extend(cell_result)
+
+        # Si alguna celda fue interrumpida, retornar inmediatamente
+        if any_cell_interrupted:
+            logging.info(f"{city_name}: Búsqueda interrumpida durante scraping de celdas")
+            return ([], True, False)  # (results, interrupted, retry_requested)
+
+        # Verificar si se solicitó retry de esta ciudad durante la búsqueda
+        if control_thread:
+            retry_city = control_thread.consume_retry_city()
+            if retry_city == city_name:
+                logging.info(f"{city_name}: Retry solicitado, reiniciando búsqueda...")
+                return ([], False, True)  # (results, interrupted, retry_requested)
+
+        # Primer deduplicado basado en el nombre y dirección antes de procesar sitios web
+        unique_results = {}
+        for result in city_results:
+            if result.get("Name"):
+                key = (
+                    result.get("Name", "").strip(),
+                    result.get("Address", "").strip(),
+                    result.get("Phone", "").strip()
+                )
+                if key not in unique_results:
+                    unique_results[key] = result
+                elif not unique_results[key].get("Website") and result.get("Website"):
+                    # Si ya existe pero no tiene sitio web y el nuevo sí, actualizamos
+                    unique_results[key] = result
+
+        final_results = list(unique_results.values())
+
+        # ==========================================================================
+        # CHECKPOINT GRANULAR: Guardar estado de ciudad para nueva búsqueda
+        # ==========================================================================
+        async with _city_state_lock:
+            _current_city_state['city_name'] = city_name
+            _current_city_state['raw_businesses'] = final_results
             _current_city_state['processed_indices'] = set()
             _current_city_state['enriched_results'] = []
+
+        # IMPORTANTE: Guardar checkpoint INMEDIATAMENTE después de encontrar negocios
+        # Esto asegura que si se para antes de completar el primer batch, no se pierden los negocios encontrados
+        if checkpoint_file and config and processed_cities is not None:
+            logging.debug(f"{city_name}: Guardando checkpoint con {len(final_results)} negocios encontrados")
+            await save_city_checkpoint(
+                checkpoint_file=checkpoint_file,
+                config=config,
+                processed_cities=processed_cities,
+                final_csv=final_csv,
+                no_emails_csv=no_emails_csv,
+                stats_thread=stats_thread
+            )
 
     # Crear semáforo para extracciones de email
     extraction_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
@@ -1387,10 +1594,30 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
     if pending_indices:
         logging.info(f"{city_name}: {len(pending_indices)} negocios pendientes de {len(final_results)} total")
 
+        # Actualizar stats con el total de negocios de esta ciudad
+        if stats_thread:
+            # Actualizar para múltiples workers - cambiar estado a "extracting"
+            stats_thread.update_city_progress(
+                city_name=city_name,
+                businesses_total=len(final_results),
+                businesses_processed=len(already_processed),
+                status='extracting'
+            )
+            # Mantener campos legacy para compatibilidad
+            stats_thread.update_stats(
+                current_city_businesses_total=len(final_results),
+                current_city_businesses_processed=len(already_processed)
+            )
+
         # Procesar en batches para poder guardar checkpoint periódicamente
         BATCH_SIZE = 10  # Guardar checkpoint cada 10 negocios
 
         for batch_start in range(0, len(pending_indices), BATCH_SIZE):
+            # === VERIFICAR STOP ANTES DE CADA BATCH ===
+            if control_thread and control_thread.stop_flag:
+                logging.info(f"{city_name}: Stop solicitado antes de batch, guardando progreso...")
+                return (enriched_results, True, False)  # (results, interrupted=True, retry=False)
+
             batch_indices = pending_indices[batch_start:batch_start + BATCH_SIZE]
 
             # Crear tareas para este batch
@@ -1407,11 +1634,24 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
                 )
                 batch_tasks.append((idx, result, task))
 
-            # Ejecutar batch en paralelo
+            # Ejecutar batch en paralelo con timeout para poder cancelar
             tasks_only = [t[2] for t in batch_tasks]
-            contact_infos = await asyncio.gather(*tasks_only, return_exceptions=True)
+            try:
+                # Timeout de 60 segundos por batch para evitar bloqueos indefinidos
+                contact_infos = await asyncio.wait_for(
+                    asyncio.gather(*tasks_only, return_exceptions=True),
+                    timeout=60.0
+                )
+            except asyncio.TimeoutError:
+                logging.warning(f"{city_name}: Timeout en batch, verificando stop...")
+                # Si hay stop, salir; si no, continuar con resultados parciales
+                if control_thread and control_thread.stop_flag:
+                    return (enriched_results, True, False)
+                # Marcar todas como error por timeout
+                contact_infos = [{"Email_Raw": "", "Email_Filtered": "", "Email_Search_Status": "Timeout"} for _ in tasks_only]
 
             # Procesar resultados del batch
+            batch_enriched = []  # Resultados enriquecidos de este batch
             for (idx, result, _), info in zip(batch_tasks, contact_infos):
                 result["Localidad"] = city_name
                 result["Region"] = city_data.get("adminName1", "")
@@ -1424,6 +1664,7 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
                     enriched["Email_Search_Status"] = "Error en enriquecimiento"
 
                 enriched_results.append(enriched)
+                batch_enriched.append(enriched)
 
                 # Actualizar estado granular
                 async with _city_state_lock:
@@ -1433,6 +1674,138 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
             # Log de progreso del batch
             processed_count = len(_current_city_state['processed_indices'])
             logging.debug(f"{city_name}: Batch completado - {processed_count}/{len(final_results)} procesados")
+
+            # === GUARDAR RESULTADOS DEL BATCH AL CSV INMEDIATAMENTE ===
+            # Esto evita perder datos si se interrumpe el proceso
+            if batch_enriched and final_csv and no_emails_csv:
+                # Filtrar duplicados usando temp_processed_businesses
+                filtered_batch = []
+                if temp_processed_businesses is not None:
+                    async with _cache_lock:
+                        for result in batch_enriched:
+                            business_id = get_business_id(result)
+                            if business_id and business_id not in temp_processed_businesses:
+                                filtered_batch.append(result)
+                                temp_processed_businesses.add(business_id)
+                else:
+                    filtered_batch = batch_enriched
+
+                if not filtered_batch:
+                    logging.debug(f"{city_name}: Batch sin resultados nuevos tras filtrar duplicados")
+                    continue  # Siguiente batch
+
+                # Crear DataFrame del batch filtrado
+                df_batch = pd.DataFrame(filtered_batch)
+
+                # Asegurar columnas necesarias
+                required_columns = ['Name', 'Localidad', 'Region', 'Address', 'Phone', 'Rating', 'Website', 'Email_Raw', 'Email_Filtered', 'Email_Search_Status', 'ID']
+                for col in required_columns:
+                    if col not in df_batch.columns:
+                        df_batch[col] = ""
+                df_batch = df_batch[required_columns]
+
+                # Separar con y sin emails
+                df_with_emails = df_batch[(df_batch["Email_Filtered"].astype(str).str.strip() != "") | (df_batch["Email_Raw"].astype(str).str.strip() != "")].copy()
+                df_no_emails = df_batch[
+                    (df_batch["Email_Filtered"].astype(str).str.strip() == "") &
+                    (df_batch["Email_Raw"].astype(str).str.strip() == "") &
+                    (df_batch["Website"].astype(str).str.strip() != "")
+                ].copy()
+
+                saved_with_emails = 0
+                saved_with_corporate = 0
+                saved_with_web = 0
+
+                # Guardar registros con emails
+                if not df_with_emails.empty:
+                    async with _csv_write_lock:
+                        try:
+                            start_id = _csv_id_counters['with_emails'] + 1
+                            df_with_emails['ID'] = range(start_id, start_id + len(df_with_emails))
+
+                            text_columns = df_with_emails.select_dtypes(include=['object']).columns
+                            for col in text_columns:
+                                df_with_emails[col] = df_with_emails[col].astype(str).str.replace('nan', '', regex=False).str.replace('None', '', regex=False).str.replace('"', '""')
+
+                            df_with_emails.to_csv(
+                                final_csv,
+                                mode='a',
+                                index=False,
+                                header=not os.path.exists(final_csv),
+                                encoding='utf-8',
+                                quoting=csv.QUOTE_ALL,
+                                doublequote=True
+                            )
+                            _csv_id_counters['with_emails'] = start_id + len(df_with_emails) - 1
+                            saved_with_emails = len(df_with_emails)
+                            saved_with_corporate = len(df_with_emails[df_with_emails["Email_Filtered"].astype(str).str.strip() != ""])
+                        except Exception as e:
+                            logging.error(f"Error guardando batch con emails: {e}")
+
+                # Guardar registros sin emails pero con web
+                if not df_no_emails.empty:
+                    async with _csv_write_lock:
+                        try:
+                            start_id = _csv_id_counters['no_emails'] + 1
+                            df_no_emails['ID'] = range(start_id, start_id + len(df_no_emails))
+
+                            text_columns = df_no_emails.select_dtypes(include=['object']).columns
+                            for col in text_columns:
+                                df_no_emails[col] = df_no_emails[col].astype(str).str.replace('nan', '', regex=False).str.replace('None', '', regex=False).str.replace('"', '""')
+
+                            df_no_emails.to_csv(
+                                no_emails_csv,
+                                mode='a',
+                                index=False,
+                                header=not os.path.exists(no_emails_csv),
+                                encoding='utf-8',
+                                quoting=csv.QUOTE_ALL,
+                                doublequote=True
+                            )
+                            _csv_id_counters['no_emails'] = start_id + len(df_no_emails) - 1
+                            saved_with_web = len(df_no_emails)
+                        except Exception as e:
+                            logging.error(f"Error guardando batch sin emails: {e}")
+
+                # Actualizar stats con los registros guardados en este batch
+                if stats_thread and (saved_with_emails > 0 or saved_with_web > 0):
+                    current_stats = stats_thread.get_stats()
+                    stats_thread.update_stats(
+                        results_total=current_stats.results_total + saved_with_emails + saved_with_web,
+                        results_with_email=current_stats.results_with_email + saved_with_emails,
+                        results_with_web=current_stats.results_with_web + saved_with_web,
+                        results_with_corporate_email=current_stats.results_with_corporate_email + saved_with_corporate
+                    )
+                    logging.debug(f"{city_name}: Batch guardado - {saved_with_emails} con email, {saved_with_web} con web")
+
+            # Actualizar stats con progreso granular después de cada batch
+            if stats_thread:
+                # Actualizar para múltiples workers
+                stats_thread.update_city_progress(
+                    city_name=city_name,
+                    businesses_processed=processed_count
+                )
+                # Mantener campo legacy
+                stats_thread.update_stats(
+                    current_city_businesses_processed=processed_count
+                )
+
+            # CHECKPOINT GRANULAR: Guardar estado después de cada batch
+            if checkpoint_file and config and processed_cities is not None:
+                await save_city_checkpoint(
+                    checkpoint_file=checkpoint_file,
+                    config=config,
+                    processed_cities=processed_cities,
+                    final_csv=final_csv,
+                    no_emails_csv=no_emails_csv,
+                    stats_thread=stats_thread
+                )
+
+            # PARADA GRANULAR: Verificar flags de control después de cada batch
+            if control_thread and (control_thread.stop_flag or control_thread.pause_flag):
+                logging.info(f"{city_name}: Parada/pausa solicitada después de batch ({processed_count}/{len(final_results)} procesados)")
+                # Retornar resultados parciales con flag de interrupción
+                return (enriched_results, True, False)  # (results, interrupted=True, retry=False)
 
     else:
         logging.info(f"{city_name}: Todos los negocios ya procesados (resume)")
@@ -1455,14 +1828,16 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
     with_web = len([r for r in deduped_results if r.get("Website") and not r.get("Email_Filtered")])
     logging.info(f"{city_name}: {total} resultados ({with_emails} con email, {with_web} con web)")
 
-    return deduped_results
+    return (deduped_results, False, False)  # (results, interrupted=False, retry=False)
 
 # -----------------------------------------------------
 # 6. Función principal (main)
 # -----------------------------------------------------
 
 async def process_city(city_data: dict, config: dict, browser, semaphore, processed_businesses: set, temp_processed_businesses: set, cache_file: str,
-                      final_csv: str, no_emails_csv: str, processed_cities: set, checkpoint_file: str, stats_thread=None) -> None:
+                      final_csv: str, no_emails_csv: str, processed_cities: set, checkpoint_file: str, stats_thread=None,
+                      control_thread=None) -> tuple:
+    """Procesa una ciudad. Retorna (interrupted, retry_requested)."""
     city_name = city_data['name']
     country_code = config['country_code']
     strategy = config['strategy']
@@ -1471,33 +1846,49 @@ async def process_city(city_data: dict, config: dict, browser, semaphore, proces
 
     try:
         logging.info(f"\nProcesando ciudad '{city_name}'. Población: {city_data.get('population', 'N/A'):,}")
-        
-        results = await scrape_city(
-            city_data=city_data, 
-            query=query, 
-            max_results=max_results, 
-            browser=browser, 
-            semaphore=semaphore, 
-            country_code=country_code, 
-            strategy=strategy
+
+        results, interrupted, retry_requested = await scrape_city(
+            city_data=city_data,
+            query=query,
+            max_results=max_results,
+            browser=browser,
+            semaphore=semaphore,
+            country_code=country_code,
+            strategy=strategy,
+            checkpoint_file=checkpoint_file,
+            config=config,
+            processed_cities=processed_cities,
+            final_csv=final_csv,
+            no_emails_csv=no_emails_csv,
+            stats_thread=stats_thread,
+            control_thread=control_thread,
+            processed_businesses=processed_businesses,
+            temp_processed_businesses=temp_processed_businesses
         )
-        
+
+        # Si se solicitó retry, limpiar estado y señalar para reencolar
+        if retry_requested:
+            logging.info(f"{city_name}: Retry solicitado, limpiando estado...")
+            clear_city_state()  # Limpiar estado de la ciudad
+            if stats_thread:
+                stats_thread.remove_active_city(city_name)
+            return (False, True)  # (interrupted=False, retry=True)
+
+        # Si fue interrumpida, no procesar resultados ni marcar como completada
+        if interrupted:
+            logging.info(f"{city_name}: Ciudad interrumpida, progreso guardado en checkpoint")
+            return (True, False)  # (interrupted=True, retry=False)
+
         if results:
-            # Filtrar negocios usando el registro temporal
+            # Filtrar negocios usando el registro temporal para evitar duplicados entre workers
             # OPTIMIZACIÓN v2: Usar lock compartido global
-            new_results = []
             async with _cache_lock:
                 for result in results:
                     business_id = get_business_id(result)
                     if business_id and business_id not in temp_processed_businesses:
-                        new_results.append(result)
                         temp_processed_businesses.add(business_id)
 
-            if not new_results:
-                log_stats(f"[{city_name}]", "Sin resultados nuevos después del filtrado temporal")
-                return
-
-            # Persist the updated full set of processed businesses immediately after adding new ones
+            # Persist the updated full set of processed businesses
             async with _cache_lock:
                 processed_businesses.update(temp_processed_businesses)
                 try:
@@ -1506,96 +1897,19 @@ async def process_city(city_data: dict, config: dict, browser, semaphore, proces
                 except Exception as e:
                     logging.error(f"Error guardando caché: {e}")
 
-            # Crear DataFrame y procesar resultados
-            df = pd.DataFrame(new_results)
-            df['Region'] = city_data.get("adminName1", "")
-            
-            # Asegurar columnas necesarias
-            required_columns = ['Name', 'Localidad', 'Region', 'Address', 'Phone', 'Rating', 'Website', 'Email_Raw', 'Email_Filtered', 'Email_Search_Status', 'ID']
-            for col in required_columns:
-                if col not in df.columns:
-                    df[col] = ""
-            
-            # Reorder columns to place Region after Localidad
-            df = df[required_columns]
+            # Mostrar resumen de la ciudad completada
+            # NOTA: Los resultados ya se guardaron al CSV en cada batch dentro de scrape_city
+            total = len(results)
+            with_emails = sum(1 for r in results if r.get("Email_Raw") or r.get("Email_Filtered"))
+            with_corporate = sum(1 for r in results if r.get("Email_Filtered"))
+            with_web = sum(1 for r in results if r.get("Website") and not r.get("Email_Raw") and not r.get("Email_Filtered"))
 
-            # Separar resultados con y sin correos
-            df_with_emails = df[(df["Email_Filtered"].astype(str).str.strip() != "") | (df["Email_Raw"].astype(str).str.strip() != "")].copy()
-            df_no_emails = df[
-                (df["Email_Filtered"].astype(str).str.strip() == "") & 
-                (df["Email_Raw"].astype(str).str.strip() == "") &
-                (df["Website"].astype(str).str.strip() != "")
-            ].copy()
-            
-            # Mostrar resumen una sola vez
-            total_new = len(df)
-            with_emails = len(df_with_emails)
-            with_web = len(df_no_emails)
-            without_both = total_new - with_emails - with_web
-            
-            log_section(f"Nuevos Resultados para {city_name}")
-            log_stats("Total encontrados:", total_new)
-            log_stats("Con correos corporativos:", with_emails)
-            log_stats("Con web pero sin correos:", with_web)
-            log_stats("Sin web ni correos:", without_both)
+            log_section(f"Ciudad completada: {city_name}")
+            log_stats("Total procesados:", total)
+            log_stats("Con email (guardados):", with_emails)
+            log_stats("  - Corporativos:", with_corporate)
+            log_stats("Con web sin email:", with_web)
 
-            # Update stats thread with result counts
-            if stats_thread:
-                current_stats = stats_thread.get_stats()
-                stats_thread.update_stats(
-                    results_total=current_stats.results_total + total_new,
-                    results_with_email=current_stats.results_with_email + with_emails,
-                    results_with_web=current_stats.results_with_web + with_web,
-                    results_with_corporate_email=current_stats.results_with_corporate_email + with_emails
-                )
-
-            # Procesar y guardar resultados con correos
-            # OPTIMIZACIÓN v2: Usar lock compartido y contador en memoria
-            if not df_with_emails.empty:
-                async with _csv_write_lock:
-                    # Usar contador en memoria en lugar de leer CSV completo
-                    start_id = _csv_id_counters['with_emails'] + 1
-                    df_with_emails['ID'] = range(start_id, start_id + len(df_with_emails))
-                    _csv_id_counters['with_emails'] = start_id + len(df_with_emails) - 1
-
-                    text_columns = df_with_emails.select_dtypes(include=['object']).columns
-                    for col in text_columns:
-                        df_with_emails[col] = df_with_emails[col].astype(str).str.replace('nan', '', regex=False).str.replace('None', '', regex=False).str.replace('"', '""')
-
-                    df_with_emails.to_csv(
-                        final_csv,
-                        mode='a',
-                        index=False,
-                        header=not os.path.exists(final_csv),
-                        encoding='utf-8',
-                        quoting=csv.QUOTE_ALL,
-                        doublequote=True
-                    )
-                    log_stats("Registros con correos guardados:", len(df_with_emails))
-
-            # Procesar y guardar resultados sin correos
-            if not df_no_emails.empty:
-                async with _csv_write_lock:
-                    # Usar contador en memoria en lugar de leer CSV completo
-                    start_id = _csv_id_counters['no_emails'] + 1
-                    df_no_emails['ID'] = range(start_id, start_id + len(df_no_emails))
-                    _csv_id_counters['no_emails'] = start_id + len(df_no_emails) - 1
-
-                    text_columns = df_no_emails.select_dtypes(include=['object']).columns
-                    for col in text_columns:
-                        df_no_emails[col] = df_no_emails[col].astype(str).str.replace('nan', '', regex=False).str.replace('None', '', regex=False).str.replace('"', '""')
-
-                    df_no_emails.to_csv(
-                        no_emails_csv,
-                        mode='a',
-                        index=False,
-                        header=not os.path.exists(no_emails_csv),
-                        encoding='utf-8',
-                        quoting=csv.QUOTE_ALL,
-                        doublequote=True
-                    )
-                    log_stats("Registros sin correos guardados:", len(df_no_emails))
-        
         # Actualizar checkpoint (ciudad completada)
         # Usa save_city_checkpoint que incluye estado granular
         processed_cities.add(city_name)
@@ -1607,9 +1921,12 @@ async def process_city(city_data: dict, config: dict, browser, semaphore, proces
             no_emails_csv=no_emails_csv,
             stats_thread=stats_thread
         )
-        
+
+        return (False, False)  # (interrupted=False, retry=False) - Ciudad completada
+
     except Exception as e:
         logging.error(f"Error procesando ciudad {city_name}: {e}", exc_info=True)
+        return (False, False)  # (interrupted=False, retry=False) - Error pero continuar
 
 async def main(stdscr): # Keep stdscr for potential dashboard use
     # Initialize config dictionary
@@ -1618,6 +1935,7 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
     worker_tasks = [] # Define worker_tasks list early
     browser = None # Define browser early
     shutdown_event = asyncio.Event() # Event to signal shutdown
+    granular_interruption = False  # Flag para indicar parada a mitad de ciudad
     dashboard_thread = None # Initialize thread var
 
     # Job Manager variables
@@ -2001,18 +2319,154 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                     args.resume = False
                     checkpoint_file = None
             else:
-                print("Intentando retomar desde el último checkpoint...")
-                # Find the latest checkpoint file in the cache directory
-                checkpoints = sorted(
-                    [os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.startswith('checkpoint_') and f.endswith('.json')],
-                    key=os.path.getmtime,
-                    reverse=True
-                )
-                if checkpoints:
-                    checkpoint_file = checkpoints[0]
-                else:
-                    print("No se encontraron archivos de checkpoint. Iniciando una nueva configuración.")
+                print("Buscando ejecuciones disponibles para retomar...")
+
+                # Usar JobManager para obtener lista de jobs (consistente con scrape_manager)
+                temp_job_manager = JobManager()
+                all_jobs = temp_job_manager.list_jobs()
+
+                # Filtrar jobs no completados (con o sin checkpoint)
+                resumable_jobs = []
+                for job in all_jobs:
+                    if job.status not in [JobStatus.COMPLETED]:
+                        # Marcar si tiene checkpoint existente
+                        job._has_checkpoint = job.checkpoint_file and os.path.exists(job.checkpoint_file)
+                        resumable_jobs.append(job)
+
+                if not resumable_jobs:
+                    print("No se encontraron ejecuciones para retomar.")
+                    print("Tip: Usa 'python scrape_manager.py' para ver el historial completo.")
                     args.resume = False
+                elif len(resumable_jobs) == 1:
+                    # Solo hay uno, usarlo directamente
+                    job = resumable_jobs[0]
+                    if job._has_checkpoint:
+                        checkpoint_file = job.checkpoint_file
+                        print(f"Única ejecución encontrada: {job.job_id}")
+                        print(f"  Query: {job.config.get('query', '?')} en {job.config.get('country_code', '?')}")
+                    else:
+                        # Sin checkpoint - usar config para empezar de cero
+                        checkpoint_file = None
+                        config = job.config
+                        print(f"Única ejecución encontrada (SIN CHECKPOINT - comenzará de cero): {job.job_id}")
+                        print(f"  Query: {config.get('query', '?')} en {config.get('country_code', '?')}")
+                        # Configurar args desde la config del job
+                        args.resume = False  # No es resume real, es relanzar
+                        args.country_code = config.get('country_code')
+                        args.query = config.get('query')
+                        args.min_population = config.get('min_population', 50000)
+                        args.max_population = config.get('max_population')
+                        args.strategy = config.get('strategy', 'simple')
+                        args.max_results = config.get('max_results', 300)
+                        args.workers = config.get('workers', 1)
+                        args.region_code = config.get('region_code')
+                        args.adm2_code = config.get('adm2_code')
+                else:
+                    # Múltiples jobs - mostrar selector interactivo
+                    print(f"\n{'='*70}")
+                    print("EJECUCIONES DISPONIBLES PARA RETOMAR")
+                    print(f"{'='*70}")
+
+                    for i, job in enumerate(resumable_jobs[:10]):  # Máximo 10
+                        query = job.config.get('query', '?')
+                        country = job.config.get('country_code', '?')
+                        cities_done = job.stats.cities_processed
+                        cities_total = job.stats.cities_total
+                        status = job.status
+                        runtime = format_duration(job.stats.runtime_seconds)
+
+                        # Indicar si tiene checkpoint o no
+                        if job._has_checkpoint:
+                            checkpoint_indicator = ""
+                            # Verificar si hay ciudad en progreso en el checkpoint
+                            city_prog = ""
+                            try:
+                                with open(job.checkpoint_file, 'r', encoding='utf-8') as f:
+                                    cp_data = json.load(f)
+                                city_in_prog = cp_data.get('city_in_progress')
+                                if city_in_prog and city_in_prog.get('city_name'):
+                                    processed = len(city_in_prog.get('processed_indices', []))
+                                    total = len(city_in_prog.get('raw_businesses', []))
+                                    city_prog = f" -> {city_in_prog['city_name']} ({processed}/{total} negocios)"
+                            except Exception:
+                                pass
+                        else:
+                            checkpoint_indicator = " [SIN CHECKPOINT]"
+                            city_prog = ""
+
+                        status_str = f"[{status.upper()}]" if status != JobStatus.INTERRUPTED else "[INTERRUMPIDO]"
+                        print(f"  [{i+1}] {job.job_id}: {query} en {country}{checkpoint_indicator}")
+                        print(f"      {status_str} {cities_done}/{cities_total} ciudades | {runtime}{city_prog}")
+
+                    print(f"\n  [0] Cancelar")
+                    print(f"{'='*70}")
+
+                    # Pedir selección (solo en modo interactivo)
+                    if not args.batch:
+                        try:
+                            selection = input("\nSelecciona ejecución a retomar [1]: ").strip()
+                            if selection == "" or selection == "1":
+                                idx = 0
+                            elif selection == "0":
+                                print("Operación cancelada.")
+                                return
+                            else:
+                                idx = int(selection) - 1
+                                if idx < 0 or idx >= len(resumable_jobs):
+                                    print("Selección inválida.")
+                                    return
+
+                            selected_job = resumable_jobs[idx]
+                            if selected_job._has_checkpoint:
+                                checkpoint_file = selected_job.checkpoint_file
+                                print(f"\nRetomando: {selected_job.job_id} - {selected_job.config.get('query')} en {selected_job.config.get('country_code')}")
+                            else:
+                                # Sin checkpoint - usar config para empezar de cero
+                                checkpoint_file = None
+                                config = selected_job.config
+                                print(f"\nRelanzando desde cero (sin checkpoint): {selected_job.job_id}")
+                                print(f"  Query: {config.get('query')} en {config.get('country_code')}")
+                                args.resume = False
+                                args.country_code = config.get('country_code')
+                                args.query = config.get('query')
+                                args.min_population = config.get('min_population', 50000)
+                                args.max_population = config.get('max_population')
+                                args.strategy = config.get('strategy', 'simple')
+                                args.max_results = config.get('max_results', 300)
+                                args.workers = config.get('workers', 1)
+                                args.region_code = config.get('region_code')
+                                args.adm2_code = config.get('adm2_code')
+                                # Eliminar el job viejo para evitar duplicados
+                                temp_job_manager.delete_job(selected_job.job_id)
+                        except ValueError:
+                            print("Entrada inválida.")
+                            return
+                        except KeyboardInterrupt:
+                            print("\nCancelado.")
+                            return
+                    else:
+                        # En modo batch, usar el más reciente con checkpoint
+                        jobs_with_checkpoint = [j for j in resumable_jobs if j._has_checkpoint]
+                        if jobs_with_checkpoint:
+                            checkpoint_file = jobs_with_checkpoint[0].checkpoint_file
+                            print(f"\nModo batch: usando ejecución más reciente con checkpoint ({jobs_with_checkpoint[0].job_id})")
+                        else:
+                            # No hay ninguno con checkpoint, usar el más reciente
+                            selected_job = resumable_jobs[0]
+                            checkpoint_file = None
+                            config = selected_job.config
+                            print(f"\nModo batch: relanzando desde cero ({selected_job.job_id})")
+                            args.resume = False
+                            args.country_code = config.get('country_code')
+                            args.query = config.get('query')
+                            args.min_population = config.get('min_population', 50000)
+                            args.max_population = config.get('max_population')
+                            args.strategy = config.get('strategy', 'simple')
+                            args.max_results = config.get('max_results', 300)
+                            args.workers = config.get('workers', 1)
+                            args.region_code = config.get('region_code')
+                            args.adm2_code = config.get('adm2_code')
+                            temp_job_manager.delete_job(selected_job.job_id)
 
             if checkpoint_file and os.path.exists(checkpoint_file):
                 try:
@@ -2106,11 +2560,16 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
 
                     # OPTIMIZACIÓN v2: Inicializar contadores de ID desde CSV existentes
                     # para evitar leer el CSV completo en cada escritura
+                    # También actualizar las stats con los valores REALES del CSV
+                    csv_email_count = 0
+                    csv_no_email_count = 0
+
                     if final_csv and os.path.exists(final_csv):
                         try:
                             with open(final_csv, 'r', encoding='utf-8') as f:
                                 line_count = sum(1 for _ in f) - 1  # -1 por header
                             _csv_id_counters['with_emails'] = max(0, line_count)
+                            csv_email_count = max(0, line_count)
                             logging.info(f"  - Contador CSV con emails inicializado: {line_count}")
                         except Exception:
                             pass
@@ -2119,9 +2578,27 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                             with open(no_emails_csv, 'r', encoding='utf-8') as f:
                                 line_count = sum(1 for _ in f) - 1
                             _csv_id_counters['no_emails'] = max(0, line_count)
+                            csv_no_email_count = max(0, line_count)
                             logging.info(f"  - Contador CSV sin emails inicializado: {line_count}")
                         except Exception:
                             pass
+
+                    # Actualizar base_stats con valores REALES del CSV (en caso de discrepancias)
+                    # results_with_email = líneas en CSV con emails (cualquier email)
+                    # results_with_corporate_email = se mantiene del checkpoint (calculado correctamente por ciudad)
+                    total_csv_records = csv_email_count + csv_no_email_count
+                    if base_stats:
+                        # Verificar si hay discrepancias y corregir
+                        if base_stats.results_with_email != csv_email_count:
+                            logging.info(f"  - Corrigiendo stats de emails: checkpoint={base_stats.results_with_email}, real={csv_email_count}")
+                            base_stats.results_with_email = csv_email_count
+                            # NO corregimos results_with_corporate_email porque eso requeriría leer el CSV completo
+                        if base_stats.results_with_web != csv_no_email_count:
+                            logging.info(f"  - Corrigiendo stats de webs sin email: checkpoint={base_stats.results_with_web}, real={csv_no_email_count}")
+                            base_stats.results_with_web = csv_no_email_count
+                        if base_stats.results_total != total_csv_records:
+                            logging.info(f"  - Corrigiendo stats de totales: checkpoint={base_stats.results_total}, real={total_csv_records}")
+                            base_stats.results_total = total_csv_records
 
                 except Exception as e:
                     logging.error(f"Error cargando checkpoint ({checkpoint_file}): {e}. No se pudo retomar.")
@@ -2651,9 +3128,17 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                     city_start_time = time.time()
                     logging.debug(f"Worker {worker_id}: Procesando {city_name}")
 
-                    # Update stats with current city
+                    # Update stats with current city (para múltiples workers)
                     if stats_thread:
                         current_index = len(processed_cities) + 1
+                        # Añadir a ciudades activas (soporta múltiples workers)
+                        stats_thread.add_active_city(
+                            city_name=city_name,
+                            worker_id=worker_id,
+                            population=city_population,
+                            index=current_index
+                        )
+                        # Mantener campos legacy para compatibilidad con 1 worker
                         stats_thread.update_stats(
                             current_city=city_name,
                             current_city_index=current_index,
@@ -2669,7 +3154,7 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                             'found': 0
                         })
                     try:
-                        await process_city(
+                        was_interrupted, retry_requested = await process_city(
                             city_data=city_data,
                             config=config, # Pass the config dict
                             browser=browser, # Pass the single browser instance
@@ -2681,8 +3166,31 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                             no_emails_csv=no_emails_csv,
                             processed_cities=processed_cities, # Pass the set to be updated
                             checkpoint_file=checkpoint_file,
-                            stats_thread=stats_thread  # Pass stats thread for metrics
+                            stats_thread=stats_thread,  # Pass stats thread for metrics
+                            control_thread=control_thread  # Pass control thread for granular stop
                         )
+
+                        # Si se solicitó retry, re-encolar la ciudad y continuar
+                        if retry_requested:
+                            logging.info(f"Worker {worker_id}: Re-encolando {city_name} para reintentar...")
+                            if stdscr and city_name in dashboard_state['active_cities']:
+                                dashboard_state['active_cities'][city_name]['status'] = 'Reintentando'
+                            await cities_queue.put(city_data)  # Re-encolar
+                            cities_queue.task_done()
+                            continue  # Siguiente ciudad
+
+                        # Si fue interrumpida, marcar flag y salir
+                        if was_interrupted:
+                            nonlocal granular_interruption
+                            granular_interruption = True  # Marcar que hubo interrupción granular
+                            logging.info(f"Worker {worker_id}: Ciudad {city_name} interrumpida, saliendo del worker...")
+                            if stdscr and city_name in dashboard_state['active_cities']:
+                                dashboard_state['active_cities'][city_name]['status'] = 'Interrumpida'
+                            # Señalar a TODOS los workers que deben parar
+                            shutdown_event.set()
+                            cities_queue.task_done()
+                            break  # Salir del worker loop
+
                         # Update total processed count for dashboard after successful processing
                         current_total_processed = len(processed_cities)
                         if stdscr:
@@ -2701,11 +3209,15 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                                 new_avg = total_time / current_total_processed
                             else:
                                 new_avg = city_duration
+                            # Eliminar de ciudades activas
+                            stats_thread.remove_active_city(city_name)
                             stats_thread.update_stats(
                                 cities_processed=current_total_processed,
                                 current_city="",
                                 current_city_index=0,
                                 current_city_population=0,
+                                current_city_businesses_total=0,
+                                current_city_businesses_processed=0,
                                 last_city_duration=city_duration,
                                 avg_city_duration=new_avg
                             )
@@ -2896,7 +3408,11 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
         # Determine final job status and update
         final_status = JobStatus.INTERRUPTED
         # Check if queue completed normally (set before shutdown_event was triggered for worker cleanup)
-        if 'queue_completed_normally' in locals() and queue_completed_normally:
+        # IMPORTANTE: Si hubo interrupción granular (a mitad de ciudad), siempre es INTERRUPTED
+        if granular_interruption:
+            final_status = JobStatus.INTERRUPTED
+            logging.info("Proceso interrumpido a mitad de ciudad (parada granular).")
+        elif 'queue_completed_normally' in locals() and queue_completed_normally:
             final_status = JobStatus.COMPLETED
             logging.info("Proceso completado normalmente.")
             # Completed successfully, remove checkpoint if it exists
