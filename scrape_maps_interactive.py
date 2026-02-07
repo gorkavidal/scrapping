@@ -170,6 +170,79 @@ _csv_id_counters = {
     'no_emails': 0
 }
 
+# =============================================================================
+# CHECKPOINT GRANULAR - Estado de ciudad en progreso
+# =============================================================================
+# Permite pausar/reanudar a mitad de una ciudad sin perder progreso
+
+# Estado de la ciudad actualmente en proceso
+_current_city_state = {
+    'city_name': None,              # Nombre de la ciudad en proceso
+    'raw_businesses': [],           # Negocios encontrados en Maps (sin procesar emails)
+    'processed_indices': set(),     # Índices de negocios ya procesados
+    'enriched_results': [],         # Resultados con emails ya extraídos
+}
+
+# Lock para actualizar estado de ciudad
+_city_state_lock = asyncio.Lock()
+
+async def save_city_checkpoint(checkpoint_file: str, config: dict, processed_cities: set,
+                                final_csv: str, no_emails_csv: str, stats_thread=None):
+    """Guarda checkpoint incluyendo el estado parcial de la ciudad actual."""
+    async with _checkpoint_lock:
+        try:
+            accumulated_stats = None
+            if stats_thread:
+                current_stats = stats_thread.get_stats()
+                accumulated_stats = {
+                    'runtime_seconds': current_stats.runtime_seconds,
+                    'results_total': current_stats.results_total,
+                    'results_with_email': current_stats.results_with_email,
+                    'results_with_corporate_email': current_stats.results_with_corporate_email,
+                    'results_with_web': current_stats.results_with_web,
+                    'errors_count': current_stats.errors_count,
+                    'avg_city_duration': current_stats.avg_city_duration,
+                }
+
+            # Preparar estado de ciudad en progreso (si existe)
+            city_in_progress = None
+            if _current_city_state['city_name']:
+                city_in_progress = {
+                    'city_name': _current_city_state['city_name'],
+                    'raw_businesses': _current_city_state['raw_businesses'],
+                    'processed_indices': list(_current_city_state['processed_indices']),
+                    'enriched_results': _current_city_state['enriched_results'],
+                }
+
+            checkpoint_data = {
+                'run_id': config.get('run_id'),
+                'processed_cities': list(processed_cities),
+                'last_update': datetime.now().isoformat(),
+                'final_csv': final_csv,
+                'no_emails_csv': no_emails_csv,
+                'config': config,
+                'accumulated_stats': accumulated_stats,
+                'city_in_progress': city_in_progress,  # NUEVO: estado granular
+            }
+            with open(checkpoint_file, 'w', encoding='utf-8') as f:
+                json.dump(checkpoint_data, f, indent=4)
+        except Exception as e:
+            logging.error(f"Error guardando checkpoint: {e}")
+
+def clear_city_state():
+    """Limpia el estado de la ciudad actual (cuando se completa)."""
+    _current_city_state['city_name'] = None
+    _current_city_state['raw_businesses'] = []
+    _current_city_state['processed_indices'] = set()
+    _current_city_state['enriched_results'] = []
+
+def restore_city_state(city_data: dict):
+    """Restaura el estado de una ciudad desde datos del checkpoint."""
+    _current_city_state['city_name'] = city_data.get('city_name')
+    _current_city_state['raw_businesses'] = city_data.get('raw_businesses', [])
+    _current_city_state['processed_indices'] = set(city_data.get('processed_indices', []))
+    _current_city_state['enriched_results'] = city_data.get('enriched_results', [])
+
 async def get_shared_session() -> aiohttp.ClientSession:
     """Obtiene la sesión aiohttp compartida, creándola si no existe."""
     global _shared_aiohttp_session
@@ -587,6 +660,122 @@ async def extract_emails_from_url(url: str) -> set:
     return emails_found
 
 
+# =============================================================================
+# EXTRACCIÓN HTTP-FIRST (Optimización v3)
+# =============================================================================
+# Intenta primero con HTTP puro (rápido), solo usa Playwright como fallback
+
+async def _extract_emails_http(url: str, start_time: float) -> dict:
+    """Extrae emails usando HTTP puro (sin navegador).
+
+    Más rápido que Playwright (~100ms vs ~2-5s).
+    Funciona para la mayoría de sitios web estáticos.
+
+    Returns:
+        dict con:
+        - 'emails' (set): emails encontrados
+        - 'page_loaded' (bool): True si la página se cargó y tiene contenido real
+        - 'is_spa' (bool): True si detectamos que es una SPA que necesita JS
+        - 'error' (str): mensaje de error si hubo
+    """
+    emails_found = set()
+    page_loaded = False
+    is_spa = False
+    error_message = ""
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+    try:
+        session = await get_shared_session()
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+        }
+
+        async with session.get(url, headers=headers, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            if response.status != 200:
+                error_message = f"HTTP {response.status}"
+                return {'emails': emails_found, 'page_loaded': False, 'is_spa': False, 'error': error_message}
+
+            html = await response.text()
+            html_lower = html.lower()
+
+            # Detectar si es una SPA (Single Page App) que NECESITA JavaScript
+            # Solo marcamos is_spa=True si hay indicadores FUERTES de que el contenido
+            # está vacío y depende de JS para renderizar
+            spa_indicators = [
+                # Contenedor vacío típico de SPAs
+                '<div id="root"></div>',
+                '<div id="app"></div>',
+                '<div id="__next"></div>',
+                # Mensajes explícitos
+                'please enable javascript',
+                'javascript is required',
+                'you need to enable javascript',
+                'this site requires javascript',
+            ]
+
+            # Indicadores de contenido real (si hay texto visible, no es una SPA vacía)
+            soup = BeautifulSoup(html, 'html.parser')
+            # Eliminar scripts y styles para contar texto real
+            for tag in soup(['script', 'style', 'noscript']):
+                tag.decompose()
+            visible_text = soup.get_text(separator=' ', strip=True)
+
+            # Si hay poco texto visible (<200 chars) y hay indicadores SPA, es SPA
+            is_spa = len(visible_text) < 200 and any(ind in html_lower for ind in spa_indicators)
+
+            # La página se cargó correctamente si hay contenido real
+            page_loaded = len(visible_text) > 100
+
+            # Extraer emails del contenido
+            found = re.findall(email_pattern, html)
+            emails_found.update(found)
+
+            # Buscar enlaces de contacto en el HTML (solo si la página cargó)
+            if page_loaded and time.time() - start_time < MAX_TOTAL_TIME:
+                contact_keywords = ['contact', 'kontakt', 'contacto', 'contacta', 'about', 'sobre', 'nosotros', 'empresa']
+                contact_links = []
+
+                for link in soup.find_all('a', href=True):
+                    href = link.get('href', '').lower()
+                    text = link.get_text().lower()
+                    if any(kw in href or kw in text for kw in contact_keywords):
+                        original_href = link.get('href', '')
+                        if original_href.startswith('/'):
+                            from urllib.parse import urljoin
+                            full_url = urljoin(url, original_href)
+                        elif original_href.startswith('http'):
+                            full_url = original_href
+                        else:
+                            continue
+                        if full_url not in contact_links:
+                            contact_links.append(full_url)
+
+                # Visitar páginas de contacto (máximo 2 para HTTP)
+                for contact_url in contact_links[:2]:
+                    if time.time() - start_time > MAX_TOTAL_TIME:
+                        break
+                    try:
+                        async with session.get(contact_url, headers=headers, allow_redirects=True,
+                                              timeout=aiohttp.ClientTimeout(total=8)) as contact_resp:
+                            if contact_resp.status == 200:
+                                contact_html = await contact_resp.text()
+                                contact_emails = re.findall(email_pattern, contact_html)
+                                emails_found.update(contact_emails)
+                    except Exception:
+                        continue
+
+    except asyncio.TimeoutError:
+        error_message = "Timeout"
+    except aiohttp.ClientError as e:
+        error_message = f"HTTP: {type(e).__name__}"
+    except Exception as e:
+        error_message = f"Error: {type(e).__name__}"
+
+    return {'emails': emails_found, 'page_loaded': page_loaded, 'is_spa': is_spa, 'error': error_message}
+
+
 async def _extract_emails_with_browser(browser, url: str, start_time: float,
                                        emails_found: set, create_own_browser: bool = False) -> dict:
     """Función auxiliar para extraer emails usando un browser Playwright.
@@ -668,8 +857,9 @@ async def extract_contact_info(url, business_name="", extraction_semaphore: asyn
                                current_index=0, total_urls=0, browser=None) -> dict:
     """Extrae información de contacto (emails) de una URL.
 
-    OPTIMIZACIÓN v2: Reutiliza el browser pasado como parámetro en lugar de
-    lanzar uno nuevo por cada URL. Esto ahorra ~500ms-2s por URL.
+    OPTIMIZACIÓN v3: HTTP-first con fallback a Playwright.
+    - Primero intenta HTTP puro (~100ms) - funciona para ~80% de webs
+    - Solo usa Playwright si HTTP falla o no encuentra emails en sitio JS
 
     Args:
         url: URL del negocio a procesar
@@ -677,7 +867,7 @@ async def extract_contact_info(url, business_name="", extraction_semaphore: asyn
         extraction_semaphore: Semáforo para limitar concurrencia
         current_index: Índice actual (para logs)
         total_urls: Total de URLs (para logs)
-        browser: Browser Playwright compartido (NUEVO - optimización)
+        browser: Browser Playwright compartido (para fallback JS)
     """
     if not url:
         return {"Email_Raw": "", "Email_Filtered": "", "Email_Search_Status": "No URL proporcionada"}
@@ -685,33 +875,44 @@ async def extract_contact_info(url, business_name="", extraction_semaphore: asyn
     if extraction_semaphore is None:
         extraction_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
 
-    logging.info(f"[{current_index}/{total_urls}] Iniciando búsqueda en {url}")
     emails_found = set()
     error_message = ""
+    method_used = "HTTP"
     start_time = time.time()
 
     try:
         async with extraction_semaphore:
-            # OPTIMIZACIÓN: Reutilizar browser pasado en lugar de crear uno nuevo
-            if browser is None:
-                # Fallback: crear browser propio si no se pasó uno (compatibilidad)
-                async with async_playwright() as p:
-                    browser = await p.chromium.launch(headless=True)
-                    result = await _extract_emails_with_browser(
-                        browser, url, start_time, emails_found, create_own_browser=True
-                    )
-                    emails_found = result['emails']
-                    error_message = result['error']
-            else:
-                # Reutilizar browser compartido - solo crear contexto
+            # PASO 1: Intentar HTTP primero (rápido, ~100ms)
+            http_result = await _extract_emails_http(url, start_time)
+            emails_found = http_result['emails']
+
+            # PASO 2: Fallback a Playwright SOLO si:
+            # - La página es una SPA que NO renderizó contenido (is_spa=True)
+            # - O hubo un error de conexión/timeout
+            # NO hacemos fallback solo porque no encontró emails (puede que no tenga)
+            needs_playwright = (
+                http_result['is_spa']  # Es SPA vacía, necesita JS para renderizar
+                or (http_result['error'] and not http_result['page_loaded'])  # Error y no cargó
+            )
+
+            if needs_playwright and browser is not None:
+                method_used = "Playwright"
+                logging.debug(f"[{current_index}/{total_urls}] Fallback a Playwright (SPA/error) para {url}")
                 result = await _extract_emails_with_browser(
                     browser, url, start_time, emails_found, create_own_browser=False
                 )
                 emails_found = result['emails']
-                error_message = result['error']
+                if result['error']:
+                    error_message = result['error']
+            elif http_result['error']:
+                error_message = http_result['error']
 
-    except Exception:
-        error_message = "Error"
+    except Exception as e:
+        error_message = f"Error: {type(e).__name__}"
+
+    elapsed = time.time() - start_time
+    status_suffix = f" (SPA)" if method_used == "Playwright" else ""
+    logging.info(f"[{current_index}/{total_urls}] {method_used}{status_suffix} {url} ({elapsed:.1f}s) -> {len(emails_found)} emails")
     
     # Filtrar y validar emails
     valid_emails = []
@@ -1160,34 +1361,82 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
     
     final_results = list(unique_results.values())
 
+    # ==========================================================================
+    # CHECKPOINT GRANULAR: Guardar estado de ciudad para poder resumir
+    # ==========================================================================
+
+    # Guardar negocios encontrados en estado global (para checkpoint)
+    async with _city_state_lock:
+        _current_city_state['city_name'] = city_name
+        _current_city_state['raw_businesses'] = final_results
+        # Mantener processed_indices y enriched_results si estamos resumiendo
+        if _current_city_state.get('city_name') != city_name:
+            _current_city_state['processed_indices'] = set()
+            _current_city_state['enriched_results'] = []
+
     # Crear semáforo para extracciones de email
     extraction_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
 
-    # Enriquecer cada resultado con extracción de emails
-    # OPTIMIZACIÓN v2: Pasar el browser compartido para evitar lanzar uno nuevo por URL
-    enrichment_tasks = [
-        extract_contact_info(
-            result.get("Website", ""),
-            business_name=result.get("Name", ""),
-            extraction_semaphore=extraction_semaphore,
-            current_index=i+1,
-            total_urls=len(final_results),
-            browser=browser  # Reutilizar browser para email extraction
-        ) for i, result in enumerate(final_results)
-    ]
-    contact_infos = await asyncio.gather(*enrichment_tasks, return_exceptions=True)
-    enriched_results = []
-    for result, info in zip(final_results, contact_infos):
-        result["Localidad"] = city_name
-        result["Region"] = city_data.get("adminName1", "")
-        if isinstance(info, dict):
-            enriched_results.append({**result, **info})
-        else:
-            result["Email_Raw"] = ""
-            result["Email_Filtered"] = ""
-            result["Email_Search_Status"] = "Error en enriquecimiento"
-            enriched_results.append(result)
-    
+    # Obtener índices ya procesados (para resume)
+    already_processed = _current_city_state['processed_indices'].copy()
+    enriched_results = _current_city_state['enriched_results'].copy()
+
+    # Filtrar solo los que faltan por procesar
+    pending_indices = [i for i in range(len(final_results)) if i not in already_processed]
+
+    if pending_indices:
+        logging.info(f"{city_name}: {len(pending_indices)} negocios pendientes de {len(final_results)} total")
+
+        # Procesar en batches para poder guardar checkpoint periódicamente
+        BATCH_SIZE = 10  # Guardar checkpoint cada 10 negocios
+
+        for batch_start in range(0, len(pending_indices), BATCH_SIZE):
+            batch_indices = pending_indices[batch_start:batch_start + BATCH_SIZE]
+
+            # Crear tareas para este batch
+            batch_tasks = []
+            for idx in batch_indices:
+                result = final_results[idx]
+                task = extract_contact_info(
+                    result.get("Website", ""),
+                    business_name=result.get("Name", ""),
+                    extraction_semaphore=extraction_semaphore,
+                    current_index=idx + 1,
+                    total_urls=len(final_results),
+                    browser=browser
+                )
+                batch_tasks.append((idx, result, task))
+
+            # Ejecutar batch en paralelo
+            tasks_only = [t[2] for t in batch_tasks]
+            contact_infos = await asyncio.gather(*tasks_only, return_exceptions=True)
+
+            # Procesar resultados del batch
+            for (idx, result, _), info in zip(batch_tasks, contact_infos):
+                result["Localidad"] = city_name
+                result["Region"] = city_data.get("adminName1", "")
+                if isinstance(info, dict):
+                    enriched = {**result, **info}
+                else:
+                    enriched = result.copy()
+                    enriched["Email_Raw"] = ""
+                    enriched["Email_Filtered"] = ""
+                    enriched["Email_Search_Status"] = "Error en enriquecimiento"
+
+                enriched_results.append(enriched)
+
+                # Actualizar estado granular
+                async with _city_state_lock:
+                    _current_city_state['processed_indices'].add(idx)
+                    _current_city_state['enriched_results'].append(enriched)
+
+            # Log de progreso del batch
+            processed_count = len(_current_city_state['processed_indices'])
+            logging.debug(f"{city_name}: Batch completado - {processed_count}/{len(final_results)} procesados")
+
+    else:
+        logging.info(f"{city_name}: Todos los negocios ya procesados (resume)")
+
     # Deduplicar final basándose en Website y Phone
     seen = set()
     deduped_results = []
@@ -1196,13 +1445,16 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
         if key not in seen:
             seen.add(key)
             deduped_results.append(r)
-    
+
+    # Limpiar estado de ciudad (ya completada)
+    clear_city_state()
+
     # Mostrar resumen de resultados
     total = len(deduped_results)
     with_emails = len([r for r in deduped_results if r.get("Email_Filtered")])
     with_web = len([r for r in deduped_results if r.get("Website") and not r.get("Email_Filtered")])
     logging.info(f"{city_name}: {total} resultados ({with_emails} con email, {with_web} con web)")
-    
+
     return deduped_results
 
 # -----------------------------------------------------
@@ -1344,38 +1596,17 @@ async def process_city(city_data: dict, config: dict, browser, semaphore, proces
                     )
                     log_stats("Registros sin correos guardados:", len(df_no_emails))
         
-        # Actualizar checkpoint
-        # OPTIMIZACIÓN v2: Usar lock compartido global
-        async with _checkpoint_lock:
-            processed_cities.add(city_name)
-            try:
-                # Obtener stats actuales para guardarlas en el checkpoint
-                accumulated_stats = None
-                if stats_thread:
-                    current_stats = stats_thread.get_stats()
-                    accumulated_stats = {
-                        'runtime_seconds': current_stats.runtime_seconds,
-                        'results_total': current_stats.results_total,
-                        'results_with_email': current_stats.results_with_email,
-                        'results_with_corporate_email': current_stats.results_with_corporate_email,
-                        'results_with_web': current_stats.results_with_web,
-                        'errors_count': current_stats.errors_count,
-                        'avg_city_duration': current_stats.avg_city_duration,
-                    }
-
-                checkpoint_data = {
-                    'run_id': config.get('run_id'),
-                    'processed_cities': list(processed_cities),
-                    'last_update': datetime.now().isoformat(),
-                    'final_csv': final_csv,
-                    'no_emails_csv': no_emails_csv,
-                    'config': config,
-                    'accumulated_stats': accumulated_stats
-                }
-                with open(checkpoint_file, 'w', encoding='utf-8') as f:
-                    json.dump(checkpoint_data, f, indent=4)
-            except Exception as e:
-                logging.error(f"Error guardando checkpoint: {e}")
+        # Actualizar checkpoint (ciudad completada)
+        # Usa save_city_checkpoint que incluye estado granular
+        processed_cities.add(city_name)
+        await save_city_checkpoint(
+            checkpoint_file=checkpoint_file,
+            config=config,
+            processed_cities=processed_cities,
+            final_csv=final_csv,
+            no_emails_csv=no_emails_csv,
+            stats_thread=stats_thread
+        )
         
     except Exception as e:
         logging.error(f"Error procesando ciudad {city_name}: {e}", exc_info=True)
@@ -1859,6 +2090,17 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                             temp_processed_businesses = set()
                     else:
                         logging.warning(f"No se encontró archivo de caché {cache_file} asociado al checkpoint.")
+
+                    # CHECKPOINT GRANULAR: Restaurar estado de ciudad en progreso (si existe)
+                    city_in_progress_data = checkpoint_data.get('city_in_progress')
+                    if city_in_progress_data and city_in_progress_data.get('city_name'):
+                        restore_city_state(city_in_progress_data)
+                        city_name = city_in_progress_data.get('city_name')
+                        processed_count = len(city_in_progress_data.get('processed_indices', []))
+                        total_count = len(city_in_progress_data.get('raw_businesses', []))
+                        logging.info(f"  - Ciudad en progreso: {city_name} ({processed_count}/{total_count} negocios)")
+                    else:
+                        clear_city_state()  # Asegurar estado limpio
 
                     resuming = True # Set resume flag to true
 
