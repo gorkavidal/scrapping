@@ -239,7 +239,7 @@ class ScrapeManager:
         if self.view_mode == "active":
             help_text = " [N]uevo [P]ausar [R]esumir [S]top [K]ill [W]orkers [T]Retry [F]iles [1]Act [2]Hist [Q]uit "
         elif self.view_mode == "history":
-            help_text = " [N]uevo [Enter]Revivir [D]eliminar [F]iles [1]Act [2]Hist [Q]uit "
+            help_text = " [N]uevo [Enter]Revivir [C]lonar [D]eliminar [F]iles [1]Act [2]Hist [Q]uit "
         else:  # files
             email_mode = "Todos" if self.show_all_emails else "Corp"
             help_text = f" [↑↓]Scroll [E]mails:{email_mode} [N]uevo [1]Act [2]Hist [Q]uit "
@@ -276,9 +276,9 @@ class ScrapeManager:
 
         # Column header - with workers column
         header_y = 2
-        col_format = "{:<8} {:<10} {:>3} {:>6}/{:<6} {:>8} {:>10} {:<22}"
+        col_format = "{:<8} {:<10} {:>3} {:>12} {:>8} {:>10} {:<22}"
         header = col_format.format(
-            "PID", "Estado", "W", "Cities", "Total", "Emails", "Runtime", "Ciudad Actual"
+            "PID", "Estado", "W", "Cities", "C/Email", "Runtime", "Ciudad Actual"
         )
 
         self.stdscr.attron(curses.A_BOLD)
@@ -311,13 +311,20 @@ class ScrapeManager:
             current_city = stats.current_city[:20] if stats.current_city else "-"
             workers = config.get('workers', 1)
 
+            # Obtener conteo real del CSV (más preciso que stats)
+            job = self.job_manager.load_job(instance.job_id)
+            if job and job.csv_with_emails and os.path.exists(job.csv_with_emails):
+                results_with_email = self.count_csv_lines(job.csv_with_emails)
+            else:
+                results_with_email = stats.results_with_email
+
+            cities_str = f"{stats.cities_processed}/{stats.cities_total}"
             line = col_format.format(
                 instance.pid,
                 display_status,
                 workers,
-                stats.cities_processed,
-                stats.cities_total,
-                stats.results_with_email,
+                cities_str,
+                results_with_email,
                 runtime,
                 current_city
             )
@@ -496,9 +503,14 @@ class ScrapeManager:
         self.stdscr.addstr(y, 4, time_line[:width - 6])
         y += 1
 
-        # Results stats
+        # Results stats - usar conteo real del CSV para precisión
+        if job and job.csv_with_emails and os.path.exists(job.csv_with_emails):
+            real_with_email = self.count_csv_lines(job.csv_with_emails)
+        else:
+            real_with_email = stats.results_with_email
+
         self.stdscr.attron(curses.color_pair(1))
-        results_line = f"Resultados: {stats.results_total} total | {stats.results_with_email} con email | {stats.results_with_corporate_email} corporativos | {stats.results_with_web} solo web"
+        results_line = f"Negocios: {stats.results_total} total | {real_with_email} con email | {stats.results_with_corporate_email} corp | {stats.results_with_web} solo web"
         self.stdscr.addstr(y, 4, results_line[:width - 6])
         self.stdscr.attroff(curses.color_pair(1))
         y += 1
@@ -534,8 +546,9 @@ class ScrapeManager:
             return "-"
 
     def count_csv_lines(self, filepath: str) -> int:
-        """Counts lines in a CSV file (excluding header).
+        """Counts records in a CSV file (excluding header).
 
+        Usa el módulo csv para manejar correctamente campos con saltos de línea.
         Usa cache con TTL para evitar lecturas repetidas.
         El cache se invalida si el archivo ha cambiado (mtime).
         """
@@ -553,11 +566,13 @@ class ScrapeManager:
                 except OSError:
                     pass
 
-        # Leer de disco
+        # Leer de disco usando csv.reader para manejar campos multilínea
         try:
             mtime = os.path.getmtime(filepath)
             with open(filepath, 'r', encoding='utf-8') as f:
-                count = sum(1 for _ in f) - 1  # Exclude header
+                reader = csv.reader(f)
+                next(reader, None)  # Skip header
+                count = sum(1 for _ in reader)
             # Guardar en cache
             self._csv_line_cache[filepath] = (mtime, count, now)
             return count
@@ -565,7 +580,7 @@ class ScrapeManager:
             return 0
 
     def draw_history(self):
-        """Draws the job history view."""
+        """Draws the job history view with details panel."""
         height, width = self.stdscr.getmaxyx()
 
         jobs = self.job_manager.list_jobs()
@@ -573,7 +588,7 @@ class ScrapeManager:
         header_y = 2
         col_format = "{:<28} {:<11} {:>6}/{:<6} {:>8} {:>10} {:<18}"
         header = col_format.format(
-            "Job ID", "Estado", "Cities", "Total", "Emails", "Runtime", "Finalizado"
+            "Job ID", "Estado", "Cities", "Total", "C/Email", "Runtime", "Finalizado"
         )
 
         self.stdscr.attron(curses.A_BOLD)
@@ -590,25 +605,32 @@ class ScrapeManager:
         if self.selected_index < 0:
             self.selected_index = 0
 
-        max_visible = height - header_y - 6
+        # Limitar lista para dejar espacio a detalles (10 líneas para detalles)
+        max_visible = min(height - header_y - 16, 8)
         start_idx = max(0, self.selected_index - max_visible + 1)
 
         for i, job in enumerate(jobs[start_idx:start_idx + max_visible]):
             actual_idx = start_idx + i
             y = header_y + 3 + i
-            if y >= height - 3:
+            if y >= height - 12:
                 break
 
             stats = job.stats
             runtime = format_duration(stats.runtime_seconds) if stats.runtime_seconds > 0 else "-"
             finished = job.finished_at[5:16] if job.finished_at else "-"
 
+            # Usar conteo real del CSV si existe
+            if job.csv_with_emails and os.path.exists(job.csv_with_emails):
+                real_with_email = self.count_csv_lines(job.csv_with_emails)
+            else:
+                real_with_email = stats.results_with_email
+
             line = col_format.format(
                 job.job_id[:26],
                 job.status[:10],
                 stats.cities_processed,
                 stats.cities_total,
-                stats.results_with_email,
+                real_with_email,
                 runtime,
                 finished
             )
@@ -627,6 +649,77 @@ class ScrapeManager:
                 self.stdscr.attroff(curses.color_pair(5))
             else:
                 self.stdscr.attroff(self.get_status_color(job.status))
+
+        # Dibujar detalles del job seleccionado
+        if jobs and self.selected_index < len(jobs):
+            detail_y = header_y + 3 + min(len(jobs), max_visible) + 1
+            self.draw_job_details(jobs[self.selected_index], detail_y)
+
+    def draw_job_details(self, job: Job, start_y: int):
+        """Draws detailed info for the selected job in history view."""
+        height, width = self.stdscr.getmaxyx()
+        if start_y >= height - 8:
+            return
+
+        stats = job.stats
+        config = job.config
+
+        self.stdscr.addstr(start_y, 0, "=" * (width - 1))
+
+        # Title
+        y = start_y + 1
+        self.stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+        title = f" {config.get('query', 'N/A')} en {config.get('country_code', 'N/A')} "
+        self.stdscr.addstr(y, 2, title[:width - 4])
+        self.stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+
+        # Config line 1
+        y += 2
+        region_info = ""
+        if config.get('region_code'):
+            region_info = f" | Región: {config.get('region_code')}"
+        if config.get('adm2_code'):
+            region_info += f" | Subdiv: {config.get('adm2_code')}"
+
+        pop_range = f"{config.get('min_population', 0):,}"
+        if config.get('max_population'):
+            pop_range += f" - {config.get('max_population'):,}"
+        else:
+            pop_range += "+"
+
+        config_line = f"Población: {pop_range} | Workers: {config.get('workers', 1)} | Estrategia: {config.get('strategy', 'simple')}{region_info}"
+        self.stdscr.addstr(y, 4, config_line[:width - 6])
+
+        # Stats line - usar conteo real del CSV
+        y += 1
+        runtime = format_duration(stats.runtime_seconds) if stats.runtime_seconds > 0 else "-"
+        if job.csv_with_emails and os.path.exists(job.csv_with_emails):
+            real_with_email = self.count_csv_lines(job.csv_with_emails)
+        else:
+            real_with_email = stats.results_with_email
+        stats_line = f"Tiempo: {runtime} | Negocios: {stats.results_total} total | {real_with_email} c/email | {stats.results_with_corporate_email} corp"
+        self.stdscr.addstr(y, 4, stats_line[:width - 6])
+
+        # Files
+        y += 1
+        if job.csv_with_emails and os.path.exists(job.csv_with_emails):
+            file_size = self.get_file_size(job.csv_with_emails)
+            self.stdscr.addstr(y, 4, f"CSV: {os.path.basename(job.csv_with_emails)} ({real_with_email} registros, {file_size})")
+        else:
+            self.stdscr.attron(curses.A_DIM)
+            self.stdscr.addstr(y, 4, "Sin archivo CSV")
+            self.stdscr.attroff(curses.A_DIM)
+
+        # Checkpoint info
+        y += 1
+        if job.checkpoint_file and os.path.exists(job.checkpoint_file):
+            self.stdscr.attron(curses.color_pair(1))
+            self.stdscr.addstr(y, 4, "✓ Checkpoint disponible (puede retomarse)")
+            self.stdscr.attroff(curses.color_pair(1))
+        else:
+            self.stdscr.attron(curses.A_DIM)
+            self.stdscr.addstr(y, 4, "✗ Sin checkpoint")
+            self.stdscr.attroff(curses.A_DIM)
 
     def draw_files_view(self):
         """Draws the file viewer with formatted CSV table."""
@@ -816,9 +909,8 @@ class ScrapeManager:
                 self.kill_instance(pid)
                 return
 
-            if key == ord('w') or key == ord('W'):
-                self.prompt_workers(pid)
-                return
+            # Nota: La opción W (cambiar workers) se ha movido a revive_job
+            # Para cambiar workers: hacer STOP, esperar a que pase a histórico, y revivir
 
             if key == ord('f') or key == ord('F'):
                 # Load file for current instance
@@ -863,6 +955,11 @@ class ScrapeManager:
                     self.load_file_tail(selected_job.csv_with_emails, 200)
                 else:
                     self.show_message("No hay archivo de resultados disponible")
+                return
+
+            if key == ord('c') or key == ord('C'):
+                # Clone job as new - use config to pre-fill wizard
+                self.clone_job_as_new(selected_job)
                 return
 
     def send_command_with_feedback(self, pid: int, command: str, display_name: str):
@@ -1001,33 +1098,23 @@ class ScrapeManager:
         else:
             self.show_message(f"Error enviando RETRY para '{city_name}'")
 
-    def prompt_workers(self, pid: int):
-        """Prompts for new worker count, updates checkpoint, stops job and relaunches.
+    def revive_job(self, job: Job):
+        """Revives an interrupted job by launching a new process.
 
-        Since workers can't be changed dynamically, this:
-        1. Asks for new worker count
-        2. Updates the checkpoint file with new workers
-        3. Sends STOP command to gracefully stop current job
-        4. Relaunches with --resume to pick up new workers
+        Asks for worker count before relaunching.
+        The old job entry is deleted from history to avoid duplicates.
+        - If checkpoint exists: uses --resume to continue from where it left off
+        - If no checkpoint: uses --batch with saved config to start fresh
         """
         height, width = self.stdscr.getmaxyx()
         prompt_y = height - 3
 
-        # Get instance and job info
-        instance = self.job_manager.load_instance(pid)
-        if not instance:
-            self.show_message("Instancia no encontrada")
-            return
+        # Get current worker count from config
+        current_workers = job.config.get('workers', 1)
 
-        job = self.job_manager.load_job(instance.job_id)
-        if not job:
-            self.show_message("Job no encontrado")
-            return
-
-        current_workers = instance.config.get('workers', 1)
-
+        # Ask for new worker count
         self.stdscr.addstr(prompt_y, 0, " " * (width - 1))
-        self.stdscr.addstr(prompt_y, 2, f"Workers actuales: {current_workers}. Nuevo número (1-10): ")
+        self.stdscr.addstr(prompt_y, 2, f"Workers [{current_workers}] (1-10, Enter=mantener): ")
         self.stdscr.refresh()
 
         self.stdscr.timeout(-1)
@@ -1035,168 +1122,27 @@ class ScrapeManager:
         curses.curs_set(1)
 
         try:
-            self.stdscr.move(prompt_y, 52)
+            self.stdscr.move(prompt_y, 42)
             input_bytes = self.stdscr.getstr(3)
             input_str = input_bytes.decode('utf-8').strip()
 
-            if not input_str:
-                self.show_message("Cancelado")
-                return
-
-            new_workers = int(input_str)
-            if not (1 <= new_workers <= 10):
-                self.show_message("Número de workers debe estar entre 1 y 10")
-                return
-
-            if new_workers == current_workers:
-                self.show_message("El número de workers ya es el solicitado")
-                return
-
-            # Find and update the checkpoint file using run_id
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            cache_dir = os.path.join(script_dir, "cache")
-
-            # Get run_id from job config
-            run_id = job.config.get('run_id')
-            if run_id:
-                checkpoint_file = os.path.join(cache_dir, f"checkpoint_{run_id}.json")
-                if not os.path.exists(checkpoint_file):
-                    self.show_message(f"No se encontró checkpoint para run_id {run_id}")
+            # If empty, keep current workers
+            if input_str:
+                new_workers = int(input_str)
+                if not (1 <= new_workers <= 10):
+                    self.show_message("Número de workers debe estar entre 1 y 10")
                     return
             else:
-                # Fallback: search by query/country for old checkpoints without run_id
-                checkpoint_file = None
-                if os.path.exists(cache_dir):
-                    for filename in os.listdir(cache_dir):
-                        if filename.startswith("checkpoint_") and filename.endswith(".json"):
-                            filepath = os.path.join(cache_dir, filename)
-                            try:
-                                with open(filepath, 'r', encoding='utf-8') as f:
-                                    data = json.load(f)
-                                # Check if this checkpoint matches the job config
-                                if data.get('config', {}).get('query') == job.config.get('query') and \
-                                   data.get('config', {}).get('country_code') == job.config.get('country_code'):
-                                    checkpoint_file = filepath
-                                    break
-                            except:
-                                continue
-
-                if not checkpoint_file:
-                    self.show_message("No se encontró el checkpoint para este job")
-                    return
-
-            # Update checkpoint with new workers
-            with open(checkpoint_file, 'r', encoding='utf-8') as f:
-                checkpoint_data = json.load(f)
-
-            checkpoint_data['config']['workers'] = new_workers
-            with open(checkpoint_file, 'w', encoding='utf-8') as f:
-                json.dump(checkpoint_data, f, indent=4)
-
-            script_path = os.path.join(script_dir, "scrape_maps_interactive.py")
-            log_file = os.path.join(script_dir, "scrapping_background.log")
-
-            is_paused = instance.status == JobStatus.PAUSED
-            start_time = time.time()
-
-            if is_paused:
-                # If paused, kill directly - checkpoint is already saved
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                    time.sleep(0.5)  # Brief pause for kill to take effect
-                except OSError:
-                    pass
-                kill_method = "kill (pausado)"
-            else:
-                # If running, send STOP and wait for graceful termination
-                self.job_manager.send_command(pid, ControlCommand.STOP)
-
-                # Wait for process to stop with interactive feedback
-                self.stdscr.timeout(500)  # Check every 500ms
-                curses.noecho()
-                curses.curs_set(0)
-
-                force_killed = False
-
-                while True:
-                    # Check if process has finished by verifying instance unregistration
-                    # The scraper calls unregister_instance() when it stops gracefully
-                    instance = self.job_manager.load_instance(pid)
-                    if instance is None:
-                        # Process finished and unregistered itself
-                        break
-
-                    # Update display
-                    elapsed = int(time.time() - start_time)
-                    self.stdscr.addstr(prompt_y, 0, " " * (width - 1))
-                    self.stdscr.addstr(prompt_y, 2,
-                        f"Esperando fin... {elapsed}s  [F]=Forzar kill  [Esc]=Cancelar")
-                    self.stdscr.refresh()
-
-                    # Check for user input
-                    key = self.stdscr.getch()
-                    if key == ord('f') or key == ord('F'):
-                        # Force kill
-                        try:
-                            os.kill(pid, signal.SIGKILL)
-                            force_killed = True
-                            self.stdscr.addstr(prompt_y, 0, " " * (width - 1))
-                            self.stdscr.addstr(prompt_y, 2, "Forzando terminación...")
-                            self.stdscr.refresh()
-                            time.sleep(0.5)
-                        except OSError:
-                            pass
-                        break
-                    elif key == 27:  # Escape
-                        self.show_message("Cancelado - el proceso sigue ejecutándose")
-                        return
-
-                kill_method = "forzado" if force_killed else "graceful"
-
-            # Process is dead, clean up and relaunch
-            elapsed = int(time.time() - start_time)
-
-            try:
-                # Clean up old instance and job
-                self.job_manager.unregister_instance(pid)
-                self.job_manager.delete_job(job.job_id)
-
-                with open(log_file, 'a') as lf:
-                    lf.write(f"\n{'='*60}\n")
-                    lf.write(f"Relanzando con {new_workers} workers (esperó {elapsed}s, {kill_method})\n")
-                    lf.write(f"Run ID: {run_id}\n")
-                    lf.write(f"Timestamp: {datetime.now().isoformat()}\n")
-                    lf.write(f"{'='*60}\n")
-                    # Use --run-id to resume the specific run
-                    cmd = [sys.executable, script_path, '--resume', '--batch']
-                    if run_id:
-                        cmd.extend(['--run-id', run_id])
-                    subprocess.Popen(
-                        cmd,
-                        stdout=lf, stderr=subprocess.STDOUT,
-                        start_new_session=True
-                    )
-
-                self.show_message(f"Relanzado con {new_workers} workers ({kill_method}, {elapsed}s)", 5.0)
-            except Exception as e:
-                self.show_message(f"Error relanzando: {e}")
+                new_workers = current_workers
 
         except ValueError:
             self.show_message("Entrada inválida - debe ser un número")
-        except Exception as e:
-            self.show_message(f"Error: {e}")
+            return
         finally:
             curses.noecho()
             curses.curs_set(0)
             self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
 
-    def revive_job(self, job: Job):
-        """Revives an interrupted job by launching a new process.
-
-        The old job entry is deleted from history to avoid duplicates.
-        - If checkpoint exists: uses --resume to continue from where it left off
-        - If no checkpoint: uses --batch with saved config to start fresh
-        """
         script_dir = os.path.dirname(os.path.abspath(__file__))
         script_path = os.path.join(script_dir, "scrape_maps_interactive.py")
         log_file = os.path.join(script_dir, "scrapping_background.log")
@@ -1204,6 +1150,18 @@ class ScrapeManager:
         # Check if checkpoint exists
         has_checkpoint = job.checkpoint_file and os.path.exists(job.checkpoint_file)
         run_id = job.config.get('run_id')
+
+        # Update checkpoint with new workers if needed
+        if has_checkpoint and new_workers != current_workers:
+            try:
+                with open(job.checkpoint_file, 'r', encoding='utf-8') as f:
+                    checkpoint_data = json.load(f)
+                checkpoint_data['config']['workers'] = new_workers
+                with open(job.checkpoint_file, 'w', encoding='utf-8') as f:
+                    json.dump(checkpoint_data, f, indent=4)
+            except Exception as e:
+                self.show_message(f"Error actualizando checkpoint: {e}")
+                return
 
         if has_checkpoint:
             # Resume from checkpoint
@@ -1214,10 +1172,11 @@ class ScrapeManager:
             ]
             if run_id:
                 cmd_parts.extend(['--run-id', run_id])
-            mode_msg = "retomando desde checkpoint"
+            mode_msg = f"retomando con {new_workers} workers"
         else:
             # Start fresh with saved config
-            config = job.config
+            config = job.config.copy()
+            config['workers'] = new_workers  # Use new worker count
             cmd_parts = [
                 sys.executable, script_path,
                 '--batch',
@@ -1226,7 +1185,7 @@ class ScrapeManager:
                 '--min_population', str(config.get('min_population', 50000)),
                 '--strategy', config.get('strategy', 'simple'),
                 '--max_results', str(config.get('max_results', 300)),
-                '--workers', str(config.get('workers', 1)),
+                '--workers', str(new_workers),
             ]
             if config.get('max_population'):
                 cmd_parts.extend(['--max_population', str(config['max_population'])])
@@ -1234,7 +1193,7 @@ class ScrapeManager:
                 cmd_parts.extend(['--region_code', config['region_code']])
             if config.get('adm2_code'):
                 cmd_parts.extend(['--adm2_code', config['adm2_code']])
-            mode_msg = "comenzando de cero (sin checkpoint)"
+            mode_msg = f"comenzando de cero con {new_workers} workers"
 
         try:
             with open(log_file, 'a') as lf:
@@ -1259,6 +1218,45 @@ class ScrapeManager:
             self.show_message(f"Job revivido ({mode_msg}) PID {proc.pid}", 5.0)
         except Exception as e:
             self.show_message(f"Error reviviendo job: {e}")
+
+    def clone_job_as_new(self, job: Job):
+        """Clones a job's configuration to create a new job via the wizard.
+
+        Pre-fills the wizard with the selected job's config, allowing the user
+        to modify it before launching.
+        """
+        # Save job config to wizard_config.json so the wizard picks it up
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        cache_dir = os.path.join(script_dir, "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        wizard_config_path = os.path.join(cache_dir, "wizard_config.json")
+
+        # Build wizard config from job config
+        config = job.config.copy()
+        wizard_config = {
+            'country_code': config.get('country_code', 'ES'),
+            'query': config.get('query', ''),
+            'min_population': config.get('min_population', 50000),
+            'max_population': config.get('max_population'),
+            'strategy': config.get('strategy', 'simple'),
+            'max_results': config.get('max_results', 300),
+            'workers': config.get('workers', 1),
+            'region_code': config.get('region_code'),
+            'region_name': config.get('region_name'),
+            'adm2_code': config.get('adm2_code'),
+            'adm2_name': config.get('adm2_name'),
+        }
+
+        try:
+            with open(wizard_config_path, 'w', encoding='utf-8') as f:
+                json.dump(wizard_config, f, indent=4)
+        except Exception as e:
+            self.show_message(f"Error guardando config: {e}")
+            return
+
+        # Show message and launch wizard
+        self.show_message(f"Clonando config de: {config.get('query', 'job')}")
+        self.new_scraping_wizard()
 
     def check_cookies_valid(self) -> tuple[bool, str]:
         """Checks if Google Maps cookies exist and are recent (less than 7 days old).
