@@ -171,24 +171,26 @@ _csv_id_counters = {
 }
 
 # =============================================================================
-# CHECKPOINT GRANULAR - Estado de ciudad en progreso
+# CHECKPOINT GRANULAR - Estado de ciudades en progreso
 # =============================================================================
 # Permite pausar/reanudar a mitad de una ciudad sin perder progreso
+# Soporta múltiples ciudades en paralelo (una por worker)
 
-# Estado de la ciudad actualmente en proceso
-_current_city_state = {
-    'city_name': None,              # Nombre de la ciudad en proceso
-    'raw_businesses': [],           # Negocios encontrados en Maps (sin procesar emails)
-    'processed_indices': set(),     # Índices de negocios ya procesados
-    'enriched_results': [],         # Resultados con emails ya extraídos
-}
+# Estado de TODAS las ciudades actualmente en proceso (key: city_name)
+_cities_in_progress = {}
+# Estructura de cada entrada:
+# {
+#     'raw_businesses': [],           # Negocios encontrados en Maps (sin procesar emails)
+#     'processed_indices': set(),     # Índices de negocios ya procesados
+#     'enriched_results': [],         # Resultados con emails ya extraídos
+# }
 
-# Lock para actualizar estado de ciudad
+# Lock para actualizar estado de ciudades
 _city_state_lock = asyncio.Lock()
 
 async def save_city_checkpoint(checkpoint_file: str, config: dict, processed_cities: set,
                                 final_csv: str, no_emails_csv: str, stats_thread=None):
-    """Guarda checkpoint incluyendo el estado parcial de la ciudad actual."""
+    """Guarda checkpoint incluyendo el estado parcial de TODAS las ciudades activas."""
     async with _checkpoint_lock:
         try:
             accumulated_stats = None
@@ -204,15 +206,15 @@ async def save_city_checkpoint(checkpoint_file: str, config: dict, processed_cit
                     'avg_city_duration': current_stats.avg_city_duration,
                 }
 
-            # Preparar estado de ciudad en progreso (si existe)
-            city_in_progress = None
-            if _current_city_state['city_name']:
-                city_in_progress = {
-                    'city_name': _current_city_state['city_name'],
-                    'raw_businesses': _current_city_state['raw_businesses'],
-                    'processed_indices': list(_current_city_state['processed_indices']),
-                    'enriched_results': _current_city_state['enriched_results'],
-                }
+            # Preparar estado de TODAS las ciudades en progreso
+            cities_in_progress = {}
+            for city_name, state in _cities_in_progress.items():
+                if state.get('raw_businesses'):  # Solo guardar si hay negocios
+                    cities_in_progress[city_name] = {
+                        'raw_businesses': state['raw_businesses'],
+                        'processed_indices': list(state['processed_indices']),
+                        'enriched_results': state['enriched_results'],
+                    }
 
             checkpoint_data = {
                 'run_id': config.get('run_id'),
@@ -222,26 +224,53 @@ async def save_city_checkpoint(checkpoint_file: str, config: dict, processed_cit
                 'no_emails_csv': no_emails_csv,
                 'config': config,
                 'accumulated_stats': accumulated_stats,
-                'city_in_progress': city_in_progress,  # NUEVO: estado granular
+                'cities_in_progress': cities_in_progress,  # NUEVO: múltiples ciudades
             }
             with open(checkpoint_file, 'w', encoding='utf-8') as f:
                 json.dump(checkpoint_data, f, indent=4)
         except Exception as e:
             logging.error(f"Error guardando checkpoint: {e}")
 
-def clear_city_state():
-    """Limpia el estado de la ciudad actual (cuando se completa)."""
-    _current_city_state['city_name'] = None
-    _current_city_state['raw_businesses'] = []
-    _current_city_state['processed_indices'] = set()
-    _current_city_state['enriched_results'] = []
+def clear_city_state(city_name: str = None):
+    """Limpia el estado de una ciudad específica (cuando se completa).
 
-def restore_city_state(city_data: dict):
-    """Restaura el estado de una ciudad desde datos del checkpoint."""
-    _current_city_state['city_name'] = city_data.get('city_name')
-    _current_city_state['raw_businesses'] = city_data.get('raw_businesses', [])
-    _current_city_state['processed_indices'] = set(city_data.get('processed_indices', []))
-    _current_city_state['enriched_results'] = city_data.get('enriched_results', [])
+    Si city_name es None, limpia todas las ciudades (para nueva ejecución).
+    """
+    if city_name is None:
+        _cities_in_progress.clear()
+    elif city_name in _cities_in_progress:
+        del _cities_in_progress[city_name]
+
+def restore_cities_state(cities_data: dict):
+    """Restaura el estado de múltiples ciudades desde datos del checkpoint.
+
+    cities_data: dict con key=city_name, value=estado de la ciudad
+    """
+    _cities_in_progress.clear()
+    for city_name, state in cities_data.items():
+        _cities_in_progress[city_name] = {
+            'raw_businesses': state.get('raw_businesses', []),
+            'processed_indices': set(state.get('processed_indices', [])),
+            'enriched_results': state.get('enriched_results', []),
+        }
+
+def get_city_state(city_name: str) -> dict:
+    """Obtiene el estado guardado de una ciudad específica, o None si no existe."""
+    return _cities_in_progress.get(city_name)
+
+def set_city_state(city_name: str, raw_businesses: list, processed_indices: set = None, enriched_results: list = None):
+    """Establece o actualiza el estado de una ciudad."""
+    _cities_in_progress[city_name] = {
+        'raw_businesses': raw_businesses,
+        'processed_indices': processed_indices or set(),
+        'enriched_results': enriched_results or [],
+    }
+
+def update_city_progress(city_name: str, processed_idx: int, enriched_result: dict):
+    """Actualiza el progreso de una ciudad añadiendo un negocio procesado."""
+    if city_name in _cities_in_progress:
+        _cities_in_progress[city_name]['processed_indices'].add(processed_idx)
+        _cities_in_progress[city_name]['enriched_results'].append(enriched_result)
 
 async def get_shared_session() -> aiohttp.ClientSession:
     """Obtiene la sesión aiohttp compartida, creándola si no existe."""
@@ -1440,14 +1469,16 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
     resuming_city = False
     saved_final_results = None
     async with _city_state_lock:
-        if (_current_city_state.get('city_name') == city_name and
-            _current_city_state.get('raw_businesses') and
-            len(_current_city_state.get('processed_indices', set())) > 0):
-            # Tenemos estado guardado con progreso - usar negocios del checkpoint
-            saved_final_results = _current_city_state['raw_businesses']
-            processed_count = len(_current_city_state['processed_indices'])
+        city_state = get_city_state(city_name)
+        if city_state and city_state.get('raw_businesses'):
+            # Tenemos estado guardado - usar negocios del checkpoint
+            saved_final_results = city_state['raw_businesses']
+            processed_count = len(city_state.get('processed_indices', set()))
             total_count = len(saved_final_results)
-            logging.info(f"Resumiendo ciudad: {city_name} ({processed_count}/{total_count} negocios ya procesados)")
+            if processed_count > 0:
+                logging.info(f"Resumiendo ciudad: {city_name} ({processed_count}/{total_count} negocios ya procesados)")
+            else:
+                logging.info(f"Retomando ciudad: {city_name} (0/{total_count} - búsqueda Maps ya hecha)")
             resuming_city = True
 
     # Si estamos resumiendo, usar los negocios guardados; si no, buscar nuevos
@@ -1563,10 +1594,7 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
         # CHECKPOINT GRANULAR: Guardar estado de ciudad para nueva búsqueda
         # ==========================================================================
         async with _city_state_lock:
-            _current_city_state['city_name'] = city_name
-            _current_city_state['raw_businesses'] = final_results
-            _current_city_state['processed_indices'] = set()
-            _current_city_state['enriched_results'] = []
+            set_city_state(city_name, raw_businesses=final_results)
 
         # IMPORTANTE: Guardar checkpoint INMEDIATAMENTE después de encontrar negocios
         # Esto asegura que si se para antes de completar el primer batch, no se pierden los negocios encontrados
@@ -1584,9 +1612,10 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
     # Crear semáforo para extracciones de email
     extraction_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
 
-    # Obtener índices ya procesados (para resume)
-    already_processed = _current_city_state['processed_indices'].copy()
-    enriched_results = _current_city_state['enriched_results'].copy()
+    # Obtener índices ya procesados (para resume) desde el estado de ESTA ciudad
+    city_state = get_city_state(city_name) or {}
+    already_processed = city_state.get('processed_indices', set()).copy()
+    enriched_results = city_state.get('enriched_results', []).copy()
 
     # Filtrar solo los que faltan por procesar
     pending_indices = [i for i in range(len(final_results)) if i not in already_processed]
@@ -1666,13 +1695,13 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
                 enriched_results.append(enriched)
                 batch_enriched.append(enriched)
 
-                # Actualizar estado granular
+                # Actualizar estado granular de ESTA ciudad
                 async with _city_state_lock:
-                    _current_city_state['processed_indices'].add(idx)
-                    _current_city_state['enriched_results'].append(enriched)
+                    update_city_progress(city_name, idx, enriched)
 
             # Log de progreso del batch
-            processed_count = len(_current_city_state['processed_indices'])
+            city_state = get_city_state(city_name) or {}
+            processed_count = len(city_state.get('processed_indices', set()))
             logging.debug(f"{city_name}: Batch completado - {processed_count}/{len(final_results)} procesados")
 
             # === GUARDAR RESULTADOS DEL BATCH AL CSV INMEDIATAMENTE ===
@@ -1820,7 +1849,7 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
             deduped_results.append(r)
 
     # Limpiar estado de ciudad (ya completada)
-    clear_city_state()
+    clear_city_state(city_name)
 
     # Mostrar resumen de resultados
     total = len(deduped_results)
@@ -1869,7 +1898,7 @@ async def process_city(city_data: dict, config: dict, browser, semaphore, proces
         # Si se solicitó retry, limpiar estado y señalar para reencolar
         if retry_requested:
             logging.info(f"{city_name}: Retry solicitado, limpiando estado...")
-            clear_city_state()  # Limpiar estado de la ciudad
+            clear_city_state(city_name)  # Limpiar estado de la ciudad
             if stats_thread:
                 stats_thread.remove_active_city(city_name)
             return (False, True)  # (interrupted=False, retry=True)
@@ -2378,16 +2407,29 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                         # Indicar si tiene checkpoint o no
                         if job._has_checkpoint:
                             checkpoint_indicator = ""
-                            # Verificar si hay ciudad en progreso en el checkpoint
+                            # Verificar si hay ciudades en progreso en el checkpoint
                             city_prog = ""
                             try:
                                 with open(job.checkpoint_file, 'r', encoding='utf-8') as f:
                                     cp_data = json.load(f)
-                                city_in_prog = cp_data.get('city_in_progress')
-                                if city_in_prog and city_in_prog.get('city_name'):
-                                    processed = len(city_in_prog.get('processed_indices', []))
-                                    total = len(city_in_prog.get('raw_businesses', []))
-                                    city_prog = f" -> {city_in_prog['city_name']} ({processed}/{total} negocios)"
+                                # Nuevo formato: cities_in_progress
+                                cities_in_prog = cp_data.get('cities_in_progress', {})
+                                # Compatibilidad con formato antiguo
+                                if not cities_in_prog:
+                                    old_city = cp_data.get('city_in_progress')
+                                    if old_city and old_city.get('city_name'):
+                                        cities_in_prog = {old_city['city_name']: old_city}
+
+                                if cities_in_prog:
+                                    city_parts = []
+                                    for cname, cdata in cities_in_prog.items():
+                                        processed = len(cdata.get('processed_indices', []))
+                                        total = len(cdata.get('raw_businesses', []))
+                                        city_parts.append(f"{cname} ({processed}/{total})")
+                                    if len(city_parts) == 1:
+                                        city_prog = f" -> {city_parts[0]}"
+                                    elif len(city_parts) > 1:
+                                        city_prog = f" -> {len(city_parts)} ciudades pendientes"
                             except Exception:
                                 pass
                         else:
@@ -2545,14 +2587,28 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                     else:
                         logging.warning(f"No se encontró archivo de caché {cache_file} asociado al checkpoint.")
 
-                    # CHECKPOINT GRANULAR: Restaurar estado de ciudad en progreso (si existe)
-                    city_in_progress_data = checkpoint_data.get('city_in_progress')
-                    if city_in_progress_data and city_in_progress_data.get('city_name'):
-                        restore_city_state(city_in_progress_data)
-                        city_name = city_in_progress_data.get('city_name')
-                        processed_count = len(city_in_progress_data.get('processed_indices', []))
-                        total_count = len(city_in_progress_data.get('raw_businesses', []))
-                        logging.info(f"  - Ciudad en progreso: {city_name} ({processed_count}/{total_count} negocios)")
+                    # CHECKPOINT GRANULAR: Restaurar estado de ciudades en progreso
+                    # Nuevo formato: cities_in_progress (dict de múltiples ciudades)
+                    cities_in_progress_data = checkpoint_data.get('cities_in_progress', {})
+
+                    # Compatibilidad: si existe el formato antiguo (city_in_progress), convertirlo
+                    old_city_data = checkpoint_data.get('city_in_progress')
+                    if old_city_data and old_city_data.get('city_name') and not cities_in_progress_data:
+                        city_name = old_city_data.get('city_name')
+                        cities_in_progress_data = {
+                            city_name: {
+                                'raw_businesses': old_city_data.get('raw_businesses', []),
+                                'processed_indices': old_city_data.get('processed_indices', []),
+                                'enriched_results': old_city_data.get('enriched_results', []),
+                            }
+                        }
+
+                    if cities_in_progress_data:
+                        restore_cities_state(cities_in_progress_data)
+                        for city_name, state in cities_in_progress_data.items():
+                            processed_count = len(state.get('processed_indices', []))
+                            total_count = len(state.get('raw_businesses', []))
+                            logging.info(f"  - Ciudad en progreso: {city_name} ({processed_count}/{total_count} negocios)")
                     else:
                         clear_city_state()  # Asegurar estado limpio
 

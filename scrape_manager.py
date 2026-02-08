@@ -1119,11 +1119,11 @@ class ScrapeManager:
                 force_killed = False
 
                 while True:
-                    # Check if process is still alive
-                    try:
-                        os.kill(pid, 0)
-                    except OSError:
-                        # Process is dead
+                    # Check if process has finished by verifying instance unregistration
+                    # The scraper calls unregister_instance() when it stops gracefully
+                    instance = self.job_manager.load_instance(pid)
+                    if instance is None:
+                        # Process finished and unregistered itself
                         break
 
                     # Update display
