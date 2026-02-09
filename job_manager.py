@@ -19,6 +19,7 @@ import json
 import threading
 import time
 import tempfile
+import logging
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, List, Tuple
@@ -614,29 +615,41 @@ class ControlThread(threading.Thread):
         self._running = True
 
     def run(self):
+        logging.debug(f"[ControlThread] Iniciado para PID {self.pid}")
+        iteration = 0
         while self._running:
+            iteration += 1
             try:
                 cmd = self.job_manager.read_command(self.pid)
                 if cmd:
                     command = cmd.get('command')
                     value = cmd.get('value')
+                    logging.info(f"[ControlThread] Comando recibido: {command} (value={value})")
 
-                    if command == ControlCommand.PAUSE:
+                    if command == ControlCommand.PAUSE or command == 'pause':
                         self.pause_flag = True
-                    elif command == ControlCommand.RESUME:
+                        logging.info(f"[ControlThread] pause_flag = True")
+                    elif command == ControlCommand.RESUME or command == 'resume':
                         self.pause_flag = False
-                    elif command == ControlCommand.STOP:
+                        logging.info(f"[ControlThread] pause_flag = False")
+                    elif command == ControlCommand.STOP or command == 'stop':
                         self.stop_flag = True
-                    elif command == ControlCommand.SET_WORKERS:
+                        logging.info(f"[ControlThread] stop_flag = True")
+                    elif command == ControlCommand.SET_WORKERS or command == 'set_workers':
                         if isinstance(value, int) and value > 0:
                             self.new_workers = value
-                    elif command == ControlCommand.RETRY_CITY:
+                            logging.info(f"[ControlThread] new_workers = {value}")
+                    elif command == ControlCommand.RETRY_CITY or command == 'retry_city':
                         if isinstance(value, str) and value:
                             self.retry_city = value
-            except Exception:
-                pass  # Ignorar errores de lectura
+                            logging.info(f"[ControlThread] retry_city = {value}")
+                    else:
+                        logging.warning(f"[ControlThread] Comando desconocido: {command}")
+            except Exception as e:
+                logging.debug(f"[ControlThread] Error en iteración {iteration}: {e}")
 
             time.sleep(self.poll_interval)
+        logging.debug(f"[ControlThread] Terminado para PID {self.pid}")
 
     def stop(self):
         self._running = False

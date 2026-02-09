@@ -49,6 +49,87 @@ def log_stats(prefix, value, suffix=""):
     msg = f"{prefix:<40} {value:>8}{suffix}"
     logging.info(msg)
 
+
+# -----------------------------------------------------
+# Helper para operaciones Playwright cancelables
+# -----------------------------------------------------
+
+class StopRequestedException(Exception):
+    """Excepción lanzada cuando se detecta una solicitud de stop durante una operación."""
+    pass
+
+
+async def cancellable_playwright_op(coro, control_thread, check_interval: float = 0.5, operation_name: str = "operación", stats_thread=None):
+    """
+    Ejecuta una operación de Playwright de forma que pueda ser cancelada si se detecta stop_flag.
+
+    En lugar de esperar a que la operación termine (que puede bloquearse indefinidamente),
+    esta función verifica periódicamente el stop_flag y cancela la operación si es necesario.
+
+    Args:
+        coro: La coroutine de Playwright a ejecutar (ej: page.goto(...))
+        control_thread: El ControlThread que contiene el stop_flag
+        check_interval: Intervalo en segundos para verificar el stop_flag (default 0.5s)
+        operation_name: Nombre descriptivo para logging
+        stats_thread: (Opcional) StatsThread para actualizar el estado a STOPPING
+
+    Returns:
+        El resultado de la operación si completa exitosamente
+
+    Raises:
+        StopRequestedException: Si se detecta stop_flag durante la operación
+        Exception: Cualquier excepción original de Playwright
+    """
+    if control_thread is None:
+        # Sin control_thread, ejecutar normalmente
+        return await coro
+
+    # Crear task para la operación
+    op_task = asyncio.create_task(coro)
+
+    try:
+        while not op_task.done():
+            # Verificar stop_flag
+            if control_thread.stop_flag:
+                logging.info(f"[Cancellable] Stop detectado durante {operation_name}, cancelando...")
+                # Actualizar estado a STOPPING para que el manager lo vea inmediatamente
+                if stats_thread:
+                    stats_thread.set_status(JobStatus.STOPPING)
+                op_task.cancel()
+                try:
+                    await op_task
+                except asyncio.CancelledError:
+                    pass
+                raise StopRequestedException(f"Stop solicitado durante {operation_name}")
+
+            # Esperar un poco antes de volver a verificar
+            try:
+                # Usar wait con timeout para no bloquear indefinidamente
+                await asyncio.wait_for(asyncio.shield(op_task), timeout=check_interval)
+                # Si llegamos aquí, la operación terminó
+                break
+            except asyncio.TimeoutError:
+                # Timeout del wait, volver a verificar stop_flag
+                continue
+            except asyncio.CancelledError:
+                # La tarea fue cancelada externamente
+                raise StopRequestedException(f"Operación {operation_name} cancelada")
+
+        # La operación completó, obtener resultado
+        return op_task.result()
+
+    except StopRequestedException:
+        raise
+    except asyncio.CancelledError:
+        # Cancelación externa
+        if not op_task.done():
+            op_task.cancel()
+            try:
+                await op_task
+            except asyncio.CancelledError:
+                pass
+        raise StopRequestedException(f"Operación {operation_name} cancelada externamente")
+
 # Estado global para el dashboard
 dashboard_state = {
     'active_cities': defaultdict(lambda: {'status': 'Iniciando...', 'progress': '0/0', 'found': 0}),
@@ -207,14 +288,44 @@ async def save_city_checkpoint(checkpoint_file: str, config: dict, processed_cit
                 }
 
             # Preparar estado de TODAS las ciudades en progreso
+            # OPTIMIZACIÓN v3: Para múltiples ciudades (multi-worker), guardar raw_businesses
+            # en archivos SEPARADOS por ciudad para no inflar el checkpoint principal.
             cities_in_progress = {}
+            num_cities_in_progress = len(_cities_in_progress)
+            run_id = config.get('run_id', 'unknown')
+
+            # Directorio para archivos de ciudades
+            city_cache_dir = os.path.join(os.path.dirname(checkpoint_file), f"cities_{run_id}")
+            if num_cities_in_progress > 1:
+                os.makedirs(city_cache_dir, exist_ok=True)
+
             for city_name, state in _cities_in_progress.items():
                 if state.get('raw_businesses'):  # Solo guardar si hay negocios
-                    cities_in_progress[city_name] = {
-                        'raw_businesses': state['raw_businesses'],
-                        'processed_indices': list(state['processed_indices']),
-                        'enriched_results': state['enriched_results'],
-                    }
+                    if num_cities_in_progress > 1:
+                        # Multi-worker: guardar raw_businesses en archivo separado
+                        safe_city_name = re.sub(r'[^\w\-]', '_', city_name)
+                        city_file = os.path.join(city_cache_dir, f"{safe_city_name}.json")
+                        try:
+                            with open(city_file, 'w', encoding='utf-8') as f:
+                                json.dump({
+                                    'raw_businesses': state['raw_businesses'],
+                                    'enriched_results': state['enriched_results'],
+                                }, f)
+                        except Exception as e:
+                            logging.error(f"Error guardando archivo de ciudad {city_name}: {e}")
+
+                        cities_in_progress[city_name] = {
+                            'raw_businesses_file': city_file,  # Referencia al archivo
+                            'processed_indices': list(state['processed_indices']),
+                            'partial': True,  # Marcar como parcial
+                        }
+                    else:
+                        # Single worker: guardar todo en checkpoint (más simple)
+                        cities_in_progress[city_name] = {
+                            'raw_businesses': state['raw_businesses'],
+                            'processed_indices': list(state['processed_indices']),
+                            'enriched_results': state['enriched_results'],
+                        }
 
             checkpoint_data = {
                 'run_id': config.get('run_id'),
@@ -245,14 +356,50 @@ def restore_cities_state(cities_data: dict):
     """Restaura el estado de múltiples ciudades desde datos del checkpoint.
 
     cities_data: dict con key=city_name, value=estado de la ciudad
+
+    Soporta dos formatos:
+    1. Formato completo: raw_businesses guardados directamente
+    2. Formato archivo: raw_businesses_file con ruta a archivo separado
     """
     _cities_in_progress.clear()
     for city_name, state in cities_data.items():
+        is_partial = state.get('partial', False)
+        processed_indices = set(state.get('processed_indices', []))
+        raw_businesses = state.get('raw_businesses', [])
+        enriched_results = state.get('enriched_results', [])
+
+        # Intentar cargar desde archivo separado si existe la referencia
+        city_file = state.get('raw_businesses_file')
+        if city_file and os.path.exists(city_file):
+            try:
+                with open(city_file, 'r', encoding='utf-8') as f:
+                    city_data = json.load(f)
+                raw_businesses = city_data.get('raw_businesses', [])
+                enriched_results = city_data.get('enriched_results', [])
+                logging.info(f"  [restore_cities_state] {city_name}: cargados {len(raw_businesses)} "
+                            f"negocios desde archivo, {len(processed_indices)} ya procesados")
+            except Exception as e:
+                logging.error(f"  [restore_cities_state] Error cargando archivo de {city_name}: {e}")
+                # Marcar como partial sin raw_businesses para re-buscar
+                is_partial = True
+                raw_businesses = []
+        elif city_file:
+            # Archivo referenciado pero no existe
+            logging.warning(f"  [restore_cities_state] {city_name}: archivo no encontrado ({city_file}), "
+                           f"se re-buscará en Maps")
+            is_partial = True
+            raw_businesses = []
+
         _cities_in_progress[city_name] = {
-            'raw_businesses': state.get('raw_businesses', []),
-            'processed_indices': set(state.get('processed_indices', [])),
-            'enriched_results': state.get('enriched_results', []),
+            'raw_businesses': raw_businesses,
+            'processed_indices': processed_indices,
+            'enriched_results': enriched_results,
+            'partial': is_partial,  # Preservar flag para lógica posterior
         }
+
+        if is_partial and not raw_businesses and processed_indices:
+            logging.info(f"  [restore_cities_state] {city_name}: partial=True, "
+                        f"{len(processed_indices)} índices ya procesados (se re-buscará en Maps)")
 
 def get_city_state(city_name: str) -> dict:
     """Obtiene el estado guardado de una ciudad específica, o None si no existe."""
@@ -1136,15 +1283,54 @@ async def scrape_google_maps_cell(query: str, cell_center: dict, fixed_zoom: int
                 context_kwargs['storage_state'] = storage_state_file
             context = await browser.new_context(**context_kwargs)
             page = await context.new_page()
-            response = await page.goto(url)
-            logging.info(f"[Celda] Status code: {response.status}")
-            await page.wait_for_load_state("domcontentloaded")
+
+            # === NAVEGACIÓN CANCELABLE A MAPS ===
+            # Usar helper cancelable para poder abortar si se solicita stop
+            try:
+                response = await cancellable_playwright_op(
+                    page.goto(url, timeout=30000),
+                    control_thread,
+                    check_interval=0.5,
+                    operation_name="navegación a Maps",
+                    stats_thread=stats_thread
+                )
+                logging.info(f"[Celda] Status code: {response.status if response else 'N/A'}")
+            except StopRequestedException:
+                logging.info(f"[Celda] Navegación cancelada por stop para {city_name}")
+                await context.close()
+                return ([], True)  # (results=[], was_interrupted=True)
+
+            # Wait for load state también cancelable
+            try:
+                await cancellable_playwright_op(
+                    page.wait_for_load_state("domcontentloaded"),
+                    control_thread,
+                    check_interval=0.5,
+                    operation_name="wait_for_load_state",
+                    stats_thread=stats_thread
+                )
+            except StopRequestedException:
+                logging.info(f"[Celda] Wait for load cancelado por stop para {city_name}")
+                await context.close()
+                return ([], True)
+
             # Esperar a que aparezca el feed de resultados o timeout razonable
             try:
-                await page.wait_for_selector(".m6QErb[role='feed']", timeout=10000)
+                await cancellable_playwright_op(
+                    page.wait_for_selector(".m6QErb[role='feed']", timeout=10000),
+                    control_thread,
+                    check_interval=0.5,
+                    operation_name="wait_for_feed",
+                    stats_thread=stats_thread
+                )
                 logging.info("[Celda] Feed de resultados detectado.")
+            except StopRequestedException:
+                logging.info(f"[Celda] Wait for feed cancelado por stop para {city_name}")
+                await context.close()
+                return ([], True)
             except Exception:
                 logging.debug("[Celda] Feed no encontrado tras 10s, continuando igualmente...")
+
             await page.wait_for_timeout(2000)
 
             # OPTIMIZACIÓN v2: Solo intentar aceptar cookies si NO hay storage_state guardado
@@ -1371,20 +1557,32 @@ async def scrape_google_maps_cell(query: str, cell_center: dict, fixed_zoom: int
                     try:
                         logging.debug(f"[Celda] Abriendo ficha para: {result['Name']} (timeout={card_timeout}ms)")
 
-                        # Usar timeout nativo de Playwright (no asyncio.wait_for que no funciona bien con Playwright)
-                        await page.goto(result["PlaceUrl"], timeout=card_timeout + 2000)  # +2s extra para navegación
-
-                        # Verificar stop inmediatamente después de goto
-                        if should_stop_immediately():
-                            logging.info(f"[Celda] Stop detectado después de goto para {city_name}")
+                        # === APERTURA DE FICHA CANCELABLE ===
+                        # Usar helper cancelable para poder abortar si se solicita stop
+                        try:
+                            await cancellable_playwright_op(
+                                page.goto(result["PlaceUrl"], timeout=card_timeout + 2000),
+                                control_thread,
+                                check_interval=0.3,  # Check más frecuente para fichas
+                                operation_name=f"goto ficha {result['Name'][:20]}",
+                                stats_thread=stats_thread
+                            )
+                        except StopRequestedException:
+                            logging.info(f"[Celda] Apertura de ficha cancelada por stop para {city_name}")
                             was_interrupted = True
                             break
 
-                        await page.wait_for_selector('a[data-item-id="authority"]', timeout=card_timeout)
-
-                        # Verificar stop inmediatamente después de wait_for_selector
-                        if should_stop_immediately():
-                            logging.info(f"[Celda] Stop detectado después de wait_for_selector para {city_name}")
+                        # Wait for selector también cancelable
+                        try:
+                            await cancellable_playwright_op(
+                                page.wait_for_selector('a[data-item-id="authority"]', timeout=card_timeout),
+                                control_thread,
+                                check_interval=0.3,
+                                operation_name=f"wait selector ficha {result['Name'][:20]}",
+                                stats_thread=stats_thread
+                            )
+                        except StopRequestedException:
+                            logging.info(f"[Celda] Wait selector cancelado por stop para {city_name}")
                             was_interrupted = True
                             break
 
@@ -1411,6 +1609,10 @@ async def scrape_google_maps_cell(query: str, cell_center: dict, fixed_zoom: int
                             consecutive_successes = 0
                             logging.debug(f"[Celda] Bajando timeout a {CARD_TIMEOUTS[current_timeout_idx]}ms tras 5 éxitos")
 
+                    except StopRequestedException:
+                        # Ya manejado arriba, pero por si acaso
+                        was_interrupted = True
+                        break
                     except Exception as e:
                         # Verificar stop también en excepciones
                         if should_stop_immediately():
@@ -1468,18 +1670,27 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
     # ==========================================================================
     resuming_city = False
     saved_final_results = None
+    preserved_processed_indices = None  # Para caso partial=True sin raw_businesses
+
     async with _city_state_lock:
         city_state = get_city_state(city_name)
-        if city_state and city_state.get('raw_businesses'):
-            # Tenemos estado guardado - usar negocios del checkpoint
-            saved_final_results = city_state['raw_businesses']
-            processed_count = len(city_state.get('processed_indices', set()))
-            total_count = len(saved_final_results)
-            if processed_count > 0:
-                logging.info(f"Resumiendo ciudad: {city_name} ({processed_count}/{total_count} negocios ya procesados)")
-            else:
-                logging.info(f"Retomando ciudad: {city_name} (0/{total_count} - búsqueda Maps ya hecha)")
-            resuming_city = True
+        if city_state:
+            if city_state.get('raw_businesses'):
+                # Caso normal: tenemos raw_businesses guardados
+                saved_final_results = city_state['raw_businesses']
+                processed_count = len(city_state.get('processed_indices', set()))
+                total_count = len(saved_final_results)
+                if processed_count > 0:
+                    logging.info(f"Resumiendo ciudad: {city_name} ({processed_count}/{total_count} negocios ya procesados)")
+                else:
+                    logging.info(f"Retomando ciudad: {city_name} (0/{total_count} - búsqueda Maps ya hecha)")
+                resuming_city = True
+            elif city_state.get('partial') and city_state.get('processed_indices'):
+                # Caso partial: multi-worker parado, tenemos índices pero no raw_businesses
+                # Re-buscaremos en Maps pero preservamos los índices ya procesados
+                preserved_processed_indices = city_state.get('processed_indices', set())
+                logging.info(f"Retomando ciudad partial: {city_name} (re-buscando en Maps, "
+                            f"{len(preserved_processed_indices)} negocios ya extraídos se saltarán)")
 
     # Si estamos resumiendo, usar los negocios guardados; si no, buscar nuevos
     if resuming_city:
@@ -1616,6 +1827,33 @@ async def scrape_city(city_data: dict, query: str, max_results: int, browser, se
     city_state = get_city_state(city_name) or {}
     already_processed = city_state.get('processed_indices', set()).copy()
     enriched_results = city_state.get('enriched_results', []).copy()
+
+    # ==========================================================================
+    # CASO ESPECIAL: partial=True y re-búsqueda en Maps
+    # Cuando tenemos partial=True, los índices ya no corresponden porque
+    # los raw_businesses son nuevos. Usamos el caché de deduplicación para
+    # filtrar negocios ya procesados (por business_id).
+    # ==========================================================================
+    if preserved_processed_indices is not None:
+        # Re-búsqueda después de partial. Los índices guardados no sirven.
+        # Filtrar usando el caché de deduplicación (processed_businesses)
+        already_processed = set()  # Ignorar índices
+        enriched_results = []  # Los enriched_results tampoco corresponden
+        logging.info(f"{city_name}: Re-búsqueda después de partial, usando caché de deduplicación")
+
+        # Filtrar negocios que ya están en el caché (ya guardados al CSV)
+        new_final_results = []
+        skipped_count = 0
+        for result in final_results:
+            business_id = get_business_id(result)
+            if business_id and business_id in temp_processed_businesses:
+                skipped_count += 1
+            else:
+                new_final_results.append(result)
+
+        if skipped_count > 0:
+            logging.info(f"{city_name}: Saltando {skipped_count} negocios ya extraídos (de {len(final_results)} total)")
+            final_results = new_final_results
 
     # Filtrar solo los que faltan por procesar
     pending_indices = [i for i in range(len(final_results)) if i not in already_processed]
@@ -2603,12 +2841,25 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                             }
                         }
 
+                    # OPTIMIZACIÓN v3: Para múltiples ciudades (multi-worker), los raw_businesses
+                    # se guardan en archivos separados para no inflar el checkpoint principal.
+                    # restore_cities_state() carga automáticamente esos archivos si existen.
+                    if len(cities_in_progress_data) > 1:
+                        logging.info(f"  - {len(cities_in_progress_data)} ciudades en progreso detectadas (multi-worker).")
+
                     if cities_in_progress_data:
                         restore_cities_state(cities_in_progress_data)
-                        for city_name, state in cities_in_progress_data.items():
-                            processed_count = len(state.get('processed_indices', []))
-                            total_count = len(state.get('raw_businesses', []))
-                            logging.info(f"  - Ciudad en progreso: {city_name} ({processed_count}/{total_count} negocios)")
+                        # Mostrar resumen después de restaurar (ahora tenemos los datos reales)
+                        for city_name in cities_in_progress_data.keys():
+                            city_state = get_city_state(city_name)
+                            if city_state:
+                                processed_count = len(city_state.get('processed_indices', set()))
+                                total_count = len(city_state.get('raw_businesses', []))
+                                is_partial = city_state.get('partial', False)
+                                if total_count > 0:
+                                    logging.info(f"  - Ciudad en progreso: {city_name} ({processed_count}/{total_count} negocios)")
+                                elif is_partial:
+                                    logging.info(f"  - Ciudad partial: {city_name} ({processed_count} procesados, re-buscará en Maps)")
                     else:
                         clear_city_state()  # Asegurar estado limpio
 
