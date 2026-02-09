@@ -730,11 +730,23 @@ python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py stop <job_id>
 # Listar archivos de resultados
 python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py results --list
 
-# Resumen de un job
+# Resumen detallado de un job (archivos, stats)
 python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py results <job_id> --summary
 
-# Obtener ruta del CSV
+# Mostrar ultimos N registros
+python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py results <job_id> --show 20
+
+# Exportar en formato JSON
+python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py results <job_id> --show 50 --format json
+
+# Exportar en formato TSV (para hojas de calculo)
+python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py results <job_id> --show 100 --format tsv
+
+# Obtener solo la ruta del CSV (para scripts)
 python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py results <job_id> --path
+
+# Ver ubicacion de todos los archivos
+python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py files
 ```
 
 ### Principios de Uso de Recursos
@@ -762,6 +774,49 @@ git pull origin main
 
 Si usaste enlace simbolico, el skill se actualiza automaticamente. Si copiaste los archivos manualmente, repite el proceso de copia.
 
+### Directorio de Salida Personalizado
+
+Por defecto, los resultados se guardan en `$SCRAPER_PATH/scrappings/`. Puedes configurar un directorio diferente:
+
+```bash
+# Opcion 1: Variable de entorno (global)
+export SCRAPER_OUTPUT_DIR="/home/user/leads/gmaps"
+
+# Opcion 2: Argumento por job
+python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py start \
+  --query "dentistas" --country ES --output-dir /path/to/results
+```
+
+**Prioridad de directorios:**
+1. `--output-dir` (argumento por job)
+2. `SCRAPER_OUTPUT_DIR` (variable de entorno)
+3. `$SCRAPER_PATH/scrappings/` (default)
+
+### Archivos Generados
+
+Cada job de scraping genera dos archivos CSV:
+
+| Archivo | Contenido |
+|---------|-----------|
+| `results_<PAIS>_<QUERY>_<ID>_<FECHA>.csv` | Negocios CON email encontrado |
+| `no_emails_<PAIS>_<QUERY>_<ID>_<FECHA>.csv` | Negocios SIN email (tienen web) |
+
+**Columnas del CSV:**
+
+| Columna | Descripcion |
+|---------|-------------|
+| `Name` | Nombre del negocio |
+| `Localidad` | Ciudad |
+| `Region` | Comunidad autonoma/estado |
+| `Address` | Direccion completa |
+| `Phone` | Telefono |
+| `Rating` | Valoracion en Google Maps |
+| `Website` | URL de la web |
+| `Email_Raw` | Todos los emails encontrados |
+| `Email_Filtered` | Solo emails corporativos (coinciden con dominio web) |
+| `Email_Search_Status` | Estado de la busqueda de email |
+| `ID` | Identificador unico |
+
 ### Troubleshooting del Skill
 
 | Problema | Solucion |
@@ -770,4 +825,5 @@ Si usaste enlace simbolico, el skill se actualiza automaticamente. Si copiaste l
 | "No module named 'job_manager'" | Verificar que SCRAPER_PATH apunta al directorio correcto |
 | "Permission denied" | Verificar permisos de escritura en los directorios |
 | "Cookies expired" | Ejecutar `python scrape_maps_interactive.py --setup` |
+| "Output directory does not exist" | Crear el directorio antes de usarlo |
 | Skill no aparece en Claude Code | Verificar que existe `~/.agents/skills/gmaps-scraper/SKILL.md` |

@@ -11,7 +11,8 @@ Usage:
     python scraper_cli.py resume <job_id>
     python scraper_cli.py stop <job_id>
     python scraper_cli.py kill <pid>
-    python scraper_cli.py results [--list] [job_id] [--summary] [--path]
+    python scraper_cli.py results [--list] [job_id] [--summary] [--path] [--show N] [--format FORMAT]
+    python scraper_cli.py files [--output-dir]
 """
 
 import os
@@ -37,6 +38,19 @@ if not SCRAPER_PATH:
 sys.path.insert(0, SCRAPER_PATH)
 
 from job_manager import JobManager, JobStatus
+
+
+def get_output_dir() -> Path:
+    """Get the output directory for results.
+
+    Priority:
+    1. SCRAPER_OUTPUT_DIR environment variable
+    2. Default: $SCRAPER_PATH/scrappings
+    """
+    output_dir = os.environ.get('SCRAPER_OUTPUT_DIR')
+    if output_dir:
+        return Path(output_dir)
+    return Path(SCRAPER_PATH) / "scrappings"
 
 
 def cmd_start(args):
@@ -71,9 +85,14 @@ def cmd_start(args):
         cmd.extend(['--max_population', str(args.max_pop)])
     if args.region:
         cmd.extend(['--region_code', args.region])
+    if args.output_dir:
+        cmd.extend(['--output_dir', args.output_dir])
 
     # Log file
     log_file = Path(SCRAPER_PATH) / "scrapping_background.log"
+
+    # Determine output directory for display
+    output_dir = args.output_dir or get_output_dir()
 
     print(f"Starting scraping job:")
     print(f"  Query: {args.query}")
@@ -81,6 +100,7 @@ def cmd_start(args):
     print(f"  Population: {args.min_pop:,}+")
     print(f"  Workers: {args.workers}")
     print(f"  Strategy: {args.strategy}")
+    print(f"  Output dir: {output_dir}")
 
     try:
         with open(log_file, 'a') as lf:
@@ -264,98 +284,307 @@ def cmd_kill(args):
         return 1
 
 
+def count_csv_records(filepath: Path) -> int:
+    """Count records in CSV using csv module (handles multiline fields)."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            next(reader, None)  # Skip header
+            return sum(1 for _ in reader)
+    except:
+        return 0
+
+
+def read_csv_records(filepath: Path) -> list:
+    """Read all records from CSV file."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            return list(reader)
+    except Exception as e:
+        print(f"Error reading CSV: {e}")
+        return []
+
+
+def format_record_table(row: dict, index: int) -> str:
+    """Format a single record for display."""
+    name = row.get('Name', '')[:45]
+    city = row.get('Localidad', '')
+    region = row.get('Region', '')
+    email_raw = row.get('Email_Raw', '')
+    email_corp = row.get('Email_Filtered', '')
+    web = row.get('Website', '')[:50] if row.get('Website') else '-'
+    phone = row.get('Phone', '')
+
+    email = email_corp if email_corp else email_raw
+    corp_mark = '★' if email_corp else ' '
+
+    lines = [f"{index:3}. {corp_mark} {name}"]
+    lines.append(f"      📍 {city}, {region}")
+    if email:
+        # Truncate long email lists
+        email_display = email[:70] + '...' if len(email) > 70 else email
+        lines.append(f"      📧 {email_display}")
+    if web != '-':
+        lines.append(f"      🌐 {web}")
+    if phone:
+        lines.append(f"      📞 {phone}")
+
+    return '\n'.join(lines)
+
+
+def format_record_csv_line(row: dict) -> str:
+    """Format record as CSV-like line for easy copying."""
+    return f"{row.get('Name', '')}\t{row.get('Email_Filtered') or row.get('Email_Raw', '')}\t{row.get('Phone', '')}\t{row.get('Website', '')}"
+
+
+def format_record_json(row: dict) -> dict:
+    """Format record as JSON-friendly dict."""
+    return {
+        'name': row.get('Name', ''),
+        'city': row.get('Localidad', ''),
+        'region': row.get('Region', ''),
+        'email': row.get('Email_Filtered') or row.get('Email_Raw', ''),
+        'email_corporate': row.get('Email_Filtered', ''),
+        'phone': row.get('Phone', ''),
+        'website': row.get('Website', ''),
+        'address': row.get('Address', ''),
+        'rating': row.get('Rating', '')
+    }
+
+
 def cmd_results(args):
     """Access scraping results."""
-    results_dir = Path(SCRAPER_PATH) / "scrappings"
+    results_dir = get_output_dir()
 
+    # Ensure directory exists
+    if not results_dir.exists():
+        print(f"Output directory does not exist: {results_dir}")
+        print(f"Set SCRAPER_OUTPUT_DIR or use default at $SCRAPER_PATH/scrappings")
+        return 1
+
+    # --list: List all result files
     if args.list_all:
-        # List all result files
         csv_files = sorted(results_dir.glob("results_*.csv"), key=lambda x: x.stat().st_mtime, reverse=True)
 
         if not csv_files:
-            print("No result files found.")
+            print(f"No result files found in {results_dir}")
             return 0
 
-        print(f"Result files ({len(csv_files)}):\n")
-        for f in csv_files[:10]:  # Show last 10
+        print(f"Result files in {results_dir}:")
+        print(f"({len(csv_files)} total, showing last 15)\n")
+
+        for f in csv_files[:15]:
             size = f.stat().st_size
             size_str = f"{size/1024:.1f}KB" if size < 1_000_000 else f"{size/1_000_000:.1f}MB"
             mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-
-            # Count lines (approximate, fast)
-            with open(f, 'r') as fh:
-                lines = sum(1 for _ in fh) - 1
+            records = count_csv_records(f)
 
             print(f"  {f.name}")
-            print(f"    {lines} records | {size_str} | {mtime}")
+            print(f"    {records} records | {size_str} | {mtime}")
 
+        # Also show no_emails files count
+        no_email_files = list(results_dir.glob("no_emails_*.csv"))
+        if no_email_files:
+            print(f"\n  (+ {len(no_email_files)} no_emails_*.csv files)")
+
+        print(f"\nOutput directory: {results_dir}")
         return 0
 
+    # If job_id specified, find that job's results
     if args.job_id:
-        # Find result file for specific job
         job_manager = JobManager(SCRAPER_PATH)
+        job = None
+        csv_path = None
 
-        # Search in history
-        for job in job_manager.list_jobs():
-            if job.job_id.startswith(args.job_id):
-                if not job.csv_with_emails or not Path(job.csv_with_emails).exists():
-                    print(f"No result file for job {job.job_id}")
-                    return 1
-
-                csv_path = Path(job.csv_with_emails)
-
-                if args.path_only:
-                    print(csv_path)
-                    return 0
-
-                if args.summary:
-                    # Read CSV and show summary
-                    with open(csv_path, 'r', encoding='utf-8') as f:
-                        reader = csv.DictReader(f)
-                        rows = list(reader)
-
-                    total = len(rows)
-                    with_email = sum(1 for r in rows if r.get('Email_Raw', '').strip() or r.get('Email_Filtered', '').strip())
-                    corporate = sum(1 for r in rows if r.get('Email_Filtered', '').strip())
-
-                    print(f"Results for job: {job.job_id}")
-                    print(f"  Query: {job.config.get('query')}")
-                    print(f"  Country: {job.config.get('country_code')}")
-                    print(f"  File: {csv_path.name}")
-                    print(f"\nSummary:")
-                    print(f"  Total businesses: {total}")
-                    print(f"  With email: {with_email}")
-                    print(f"  Corporate emails: {corporate}")
-                    print(f"\nFile path: {csv_path}")
-                    return 0
-
-                # Default: show file info
-                print(f"Result file: {csv_path}")
-                print(f"Size: {csv_path.stat().st_size / 1024:.1f}KB")
-                return 0
+        # Search in job history
+        for j in job_manager.list_jobs():
+            if j.job_id.startswith(args.job_id):
+                job = j
+                if j.csv_with_emails and Path(j.csv_with_emails).exists():
+                    csv_path = Path(j.csv_with_emails)
+                break
 
         # Also check active instances
-        for inst in job_manager.list_instances():
-            if inst.job_id.startswith(args.job_id):
-                job = job_manager.load_job(inst.job_id)
-                if job and job.csv_with_emails:
-                    if args.path_only:
-                        print(job.csv_with_emails)
-                    else:
-                        print(f"Result file (in progress): {job.csv_with_emails}")
-                    return 0
+        if not job:
+            for inst in job_manager.list_instances():
+                if inst.job_id.startswith(args.job_id):
+                    job = job_manager.load_job(inst.job_id)
+                    if job and job.csv_with_emails:
+                        csv_path = Path(job.csv_with_emails)
+                    break
 
-        print(f"No job found matching '{args.job_id}'")
-        return 1
+        if not job:
+            print(f"No job found matching '{args.job_id}'")
+            return 1
 
-    # Default: list files
-    return cmd_results(argparse.Namespace(list_all=True, job_id=None, summary=False, path_only=False))
+        if not csv_path or not csv_path.exists():
+            print(f"No result file for job {job.job_id}")
+            print(f"Job status: {job.status}")
+            return 1
+
+        # --path: Just show the path
+        if args.path_only:
+            print(csv_path)
+            return 0
+
+        # Read the CSV
+        rows = read_csv_records(csv_path)
+
+        # Calculate stats
+        total = len(rows)
+        with_email = sum(1 for r in rows if r.get('Email_Raw', '').strip() or r.get('Email_Filtered', '').strip())
+        corporate = sum(1 for r in rows if r.get('Email_Filtered', '').strip())
+
+        # Get no_emails file if exists
+        no_emails_file = csv_path.parent / csv_path.name.replace('results_', 'no_emails_')
+        no_emails_count = count_csv_records(no_emails_file) if no_emails_file.exists() else 0
+
+        # --summary: Show summary stats
+        if args.summary:
+            print(f"Results for job: {job.job_id}")
+            print(f"  Query: {job.config.get('query')}")
+            print(f"  Country: {job.config.get('country_code')}")
+            print(f"  Status: {job.status}")
+            print()
+            print("Files generated:")
+            print(f"  📄 Results (with email): {csv_path.name}")
+            print(f"     → {total} businesses, {corporate} corporate emails")
+            if no_emails_file.exists():
+                print(f"  📄 No emails: {no_emails_file.name}")
+                print(f"     → {no_emails_count} businesses without email")
+            print()
+            print("Summary:")
+            print(f"  Total businesses scraped: {total + no_emails_count}")
+            print(f"  With any email: {with_email} ({with_email*100//(total+no_emails_count) if total+no_emails_count > 0 else 0}%)")
+            print(f"  Corporate emails: {corporate} ({corporate*100//with_email if with_email > 0 else 0}% of emails)")
+            print(f"  Without email: {no_emails_count}")
+            print()
+            print(f"File path: {csv_path}")
+            if no_emails_file.exists():
+                print(f"No-email file: {no_emails_file}")
+            return 0
+
+        # --show N: Show last N records
+        if args.show:
+            n = min(args.show, len(rows))
+            records_to_show = rows[-n:] if n < len(rows) else rows
+
+            print(f"Last {n} results from job {job.job_id}:")
+            print(f"(Query: {job.config.get('query')} in {job.config.get('country_code')})")
+            print("=" * 60)
+
+            # Format based on --format
+            if args.format == 'json':
+                output = [format_record_json(r) for r in records_to_show]
+                print(json.dumps(output, indent=2, ensure_ascii=False))
+            elif args.format == 'tsv':
+                print("Name\tEmail\tPhone\tWebsite")
+                for r in records_to_show:
+                    print(format_record_csv_line(r))
+            else:  # table (default)
+                for i, row in enumerate(records_to_show, len(rows) - n + 1):
+                    print(format_record_table(row, i))
+                    print()
+
+            print("=" * 60)
+            print(f"Showing {n} of {total} records")
+            print(f"★ = Corporate email (matches website domain)")
+            return 0
+
+        # Default: show basic info + last 5 records
+        print(f"Results for job: {job.job_id}")
+        print(f"  Query: {job.config.get('query')}")
+        print(f"  Country: {job.config.get('country_code')}")
+        print(f"  Total: {total} records with email")
+        print(f"  Corporate: {corporate}")
+        print()
+        print(f"File: {csv_path}")
+        print(f"Size: {csv_path.stat().st_size / 1024:.1f}KB")
+
+        if total > 0:
+            print()
+            print("Last 5 records:")
+            print("-" * 50)
+            for i, row in enumerate(rows[-5:], max(1, total - 4)):
+                print(format_record_table(row, i))
+                print()
+
+        print(f"\nUse --show N to see more records, --summary for stats")
+        return 0
+
+    # No job_id: list files by default
+    return cmd_results(argparse.Namespace(
+        list_all=True, job_id=None, summary=False,
+        path_only=False, show=None, format='table'
+    ))
+
+
+def cmd_files(args):
+    """Show information about output files and directories."""
+    results_dir = get_output_dir()
+    cache_dir = Path(SCRAPER_PATH) / "cache"
+    checkpoints_dir = Path(SCRAPER_PATH) / "checkpoints"
+    browser_dir = Path(SCRAPER_PATH) / "browser_data"
+
+    print("Google Maps Scraper - File Locations")
+    print("=" * 60)
+
+    print("\n📁 Output Directory (results):")
+    print(f"   {results_dir}")
+    if results_dir.exists():
+        csv_count = len(list(results_dir.glob("*.csv")))
+        total_size = sum(f.stat().st_size for f in results_dir.glob("*.csv"))
+        print(f"   {csv_count} CSV files, {total_size/1_000_000:.1f}MB total")
+    else:
+        print("   (does not exist)")
+
+    print("\n📁 Cache Directory (jobs, control):")
+    print(f"   {cache_dir}")
+
+    print("\n📁 Checkpoints Directory (resume data):")
+    print(f"   {checkpoints_dir}")
+    if checkpoints_dir.exists():
+        ckpt_count = len(list(checkpoints_dir.glob("*.json")))
+        print(f"   {ckpt_count} checkpoint files")
+
+    print("\n📁 Browser Data (cookies):")
+    print(f"   {browser_dir}")
+    cookies_file = browser_dir / "google_maps_state.json"
+    if cookies_file.exists():
+        import time
+        age_days = (time.time() - cookies_file.stat().st_mtime) / (24 * 3600)
+        status = "valid" if age_days < 7 else "EXPIRED"
+        print(f"   Cookies: {status} ({age_days:.1f} days old)")
+    else:
+        print("   Cookies: NOT FOUND (run --setup)")
+
+    print("\n" + "=" * 60)
+    print("\nFile types generated per job:")
+    print("  results_<COUNTRY>_<QUERY>_<ID>_<DATE>.csv")
+    print("    → Businesses WITH email found")
+    print("  no_emails_<COUNTRY>_<QUERY>_<ID>_<DATE>.csv")
+    print("    → Businesses WITHOUT email (have website)")
+    print()
+    print("Configure output directory:")
+    print("  export SCRAPER_OUTPUT_DIR=\"/path/to/output\"")
+
+    return 0
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Google Maps Scraper CLI",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s start --query "dentistas" --country ES
+  %(prog)s results --list
+  %(prog)s results job_2026 --summary
+  %(prog)s results job_2026 --show 20
+  %(prog)s results job_2026 --show 10 --format json
+  %(prog)s files
+"""
     )
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
@@ -369,6 +598,7 @@ def main():
     start_parser.add_argument('--strategy', choices=['simple', 'grid'], default='simple')
     start_parser.add_argument('--max-results', type=int, default=300, help='Max results per cell')
     start_parser.add_argument('--region', help='Region code to limit scope')
+    start_parser.add_argument('--output-dir', '-o', help='Output directory for results')
 
     # Pause command
     pause_parser = subparsers.add_parser('pause', help='Pause a running job')
@@ -387,11 +617,17 @@ def main():
     kill_parser.add_argument('pid', help='Process ID')
 
     # Results command
-    results_parser = subparsers.add_parser('results', help='Access results')
+    results_parser = subparsers.add_parser('results', help='Access and view results')
     results_parser.add_argument('job_id', nargs='?', help='Job ID to get results for')
     results_parser.add_argument('--list', dest='list_all', action='store_true', help='List all result files')
-    results_parser.add_argument('--summary', action='store_true', help='Show summary of results')
-    results_parser.add_argument('--path', dest='path_only', action='store_true', help='Show only file path')
+    results_parser.add_argument('--summary', action='store_true', help='Show detailed summary with stats')
+    results_parser.add_argument('--path', dest='path_only', action='store_true', help='Show only file path (for scripting)')
+    results_parser.add_argument('--show', type=int, metavar='N', help='Show last N records')
+    results_parser.add_argument('--format', choices=['table', 'json', 'tsv'], default='table',
+                               help='Output format for --show (default: table)')
+
+    # Files command
+    files_parser = subparsers.add_parser('files', help='Show file locations and output directory info')
 
     args = parser.parse_args()
 
@@ -406,6 +642,7 @@ def main():
         'stop': cmd_stop,
         'kill': cmd_kill,
         'results': cmd_results,
+        'files': cmd_files,
     }
 
     return commands[args.command](args)
