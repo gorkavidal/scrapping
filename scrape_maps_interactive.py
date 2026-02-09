@@ -2002,9 +2002,9 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
         parser = argparse.ArgumentParser(
             description='Scraper Interactivo de Google Maps usando GeoNames API.'
         )
-        # Update default value logic for geonames_username
+        # GeoNames username: env var > default (gorkota)
         parser.add_argument('--geonames_username', type=str,
-                            default=os.environ.get('GEONAMES_USERNAME', 'gorkota'), # Prioritize ENV, then 'gorkota'
+                            default=os.environ.get('GEONAMES_USERNAME', 'gorkota'),
                             help='Nombre de usuario de GeoNames (o variable de entorno GEONAMES_USERNAME, por defecto: gorkota)')
         parser.add_argument('--resume', action='store_true',
                             help='Retomar la ejecución desde el último checkpoint (en primer plano)')

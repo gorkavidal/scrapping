@@ -206,7 +206,7 @@ Carga el checkpoint y continua desde donde se quedo. Cada ejecucion tiene un `ru
 
 | Parametro | Tipo | Default | Descripcion |
 |-----------|------|---------|-------------|
-| `--geonames_username` | str | `gorkota` | Nombre de usuario de GeoNames API. Tambien acepta la variable de entorno `GEONAMES_USERNAME`. |
+| `--geonames_username` | str | `gorkota` | Nombre de usuario de GeoNames API. Tambien acepta la variable de entorno `GEONAMES_USERNAME`. Si experimentas errores de limite, [crea tu propia cuenta gratis](https://www.geonames.org/login). |
 | `--country_code` | str | *(pregunta)* | Codigo de pais ISO 3166-1 alpha-2 (ej: `ES`, `GB`, `FR`, `DE`). |
 | `--region_code` | str | *(ninguno)* | Codigo de region/comunidad autonoma (ADM1). Filtra ciudades por esta region. |
 | `--adm2_code` | str | *(ninguno)* | Codigo de provincia/condado (ADM2). Requiere `--region_code`. |
@@ -531,7 +531,7 @@ Al hacer `--resume`, las stats se sincronizan automaticamente con el contenido r
 - **Proteccion contra conflictos**: Si intentas lanzar una nueva ejecucion con la misma configuracion que un proceso activo, el script lo detecta y aborta para evitar corrupcion de datos.
 - **Interrupcion segura**: Puedes parar el proceso con `Ctrl+C`, `kill`, o desde el gestor con `S`. El proceso para despues del batch actual (cada 10 negocios), guarda checkpoint y puedes retomar con `--resume --run-id {id}`.
 - **Gestor de instancias**: Usa `scrape_manager.py` para controlar instancias en ejecucion sin interrumpir el scraping.
-- **GeoNames API**: Necesitas una cuenta gratuita en [geonames.org](https://www.geonames.org/login) para usar la API. El usuario por defecto es `gorkota`.
+- **GeoNames API**: El script usa `gorkota` como usuario por defecto. Si experimentas errores de limite (rate limiting), [crea tu propia cuenta gratis](https://www.geonames.org/login), [activa el servicio web](https://www.geonames.org/manageaccount), y configura tu usuario con `export GEONAMES_USERNAME=tu_usuario` o pasalo con `--geonames_username`.
 
 ## Skill para Claude Code / AI Assistants
 

@@ -107,6 +107,16 @@ export SCRAPER_PATH="/path/to/scrapping"
 export SCRAPER_OUTPUT_DIR="/path/to/results"
 ```
 
+**Optional: Custom GeoNames username** (if you experience rate limiting with the default `gorkota` user):
+1. Create a free account at https://www.geonames.org/login
+2. Enable free web services at https://www.geonames.org/manageaccount
+3. Set the environment variable or use `.env`:
+```bash
+export GEONAMES_USERNAME="your_geonames_username"
+```
+
+**Alternative:** Copy `.env.example` to `.env` and fill in your values.
+
 ## Running Scripts
 
 Scripts can be executed in multiple ways depending on your setup:
@@ -493,3 +503,4 @@ Both scripts auto-detect SCRAPER_PATH from environment or use relative paths.
 |----------|---------|---------|
 | `SCRAPER_PATH` | Installation directory | Auto-detected |
 | `SCRAPER_OUTPUT_DIR` | Custom output directory | `$SCRAPER_PATH/scrappings` |
+| `GEONAMES_USERNAME` | GeoNames API username (optional) | `gorkota` |
