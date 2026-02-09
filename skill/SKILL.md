@@ -34,26 +34,70 @@ This skill enables conversational control of a powerful Google Maps scraping sys
 
 ## Installation
 
-The skill requires the scrapper repository to be cloned and dependencies installed:
+The skill requires the scraper repository to be cloned and dependencies installed.
 
+### Using uv (recommended)
+
+**Linux/macOS:**
 ```bash
-# Clone repository
+# Install uv
+# macOS: brew install uv
+# Linux: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Clone and setup
+git clone https://github.com/gorkavidal/scrapping.git
+cd scrapping
+uv venv
+uv pip install -r requirements.txt
+
+# Install Playwright browsers
+.venv/bin/python -m playwright install chromium
+# Linux only (install system dependencies):
+# .venv/bin/python -m playwright install-deps chromium
+```
+
+**Windows (PowerShell):**
+```powershell
+# Install uv
+irm https://astral.sh/uv/install.ps1 | iex
+
+# Clone and setup
+git clone https://github.com/gorkavidal/scrapping.git
+cd scrapping
+uv venv
+uv pip install -r requirements.txt
+
+# Install Playwright browsers
+.venv\Scripts\python.exe -m playwright install chromium
+```
+
+### Using pip (alternative)
+
+**Linux/macOS:**
+```bash
 git clone https://github.com/gorkavidal/scrapping.git
 cd scrapping
 
-# Create virtual environment (recommended)
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# or: venv\Scripts\activate  # Windows
-
-# Install dependencies
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-
-# Install Playwright browsers
-playwright install chromium
+python -m playwright install chromium
 ```
 
-**Set the SCRAPER_PATH environment variable** to the installation directory:
+**Windows (PowerShell):**
+```powershell
+git clone https://github.com/gorkavidal/scrapping.git
+cd scrapping
+
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+### Environment Configuration
+
+**Set the SCRAPER_PATH environment variable** (add to ~/.bashrc or ~/.zshrc):
 ```bash
 export SCRAPER_PATH="/path/to/scrapping"
 ```
@@ -63,45 +107,84 @@ export SCRAPER_PATH="/path/to/scrapping"
 export SCRAPER_OUTPUT_DIR="/path/to/results"
 ```
 
+## Running Scripts
+
+Scripts can be executed in multiple ways depending on your setup:
+
+### Using uv (recommended)
+```bash
+# From the scraper directory
+cd "$SCRAPER_PATH"
+uv run skill/scripts/scraper_status.py
+uv run skill/scripts/scraper_cli.py start --query "dentistas" --country ES
+```
+
+### Using .venv directly (Linux/macOS)
+```bash
+"$SCRAPER_PATH/.venv/bin/python" "$SCRAPER_PATH/skill/scripts/scraper_status.py"
+"$SCRAPER_PATH/.venv/bin/python" "$SCRAPER_PATH/skill/scripts/scraper_cli.py" start --query "dentistas" --country ES
+```
+
+### Using .venv directly (Windows PowerShell)
+```powershell
+& "$env:SCRAPER_PATH\.venv\Scripts\python.exe" "$env:SCRAPER_PATH\skill\scripts\scraper_status.py"
+& "$env:SCRAPER_PATH\.venv\Scripts\python.exe" "$env:SCRAPER_PATH\skill\scripts\scraper_cli.py" start --query "dentistas" --country ES
+```
+
+### Using activated venv
+```bash
+# First activate the environment
+source "$SCRAPER_PATH/.venv/bin/activate"  # Linux/macOS
+# or: & "$env:SCRAPER_PATH\.venv\Scripts\Activate.ps1"  # Windows PowerShell
+
+# Then run scripts normally
+python "$SCRAPER_PATH/skill/scripts/scraper_status.py"
+```
+
+**Note:** The examples below use `uv run` syntax. Replace with your preferred method.
+
 ## Quick Reference
 
 ### Check Status (Most Common)
 ```bash
-python "$SCRAPER_PATH/skill/scripts/scraper_status.py"
+cd "$SCRAPER_PATH" && uv run skill/scripts/scraper_status.py
 ```
 
 ### Start New Scraping
 ```bash
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" start \
+cd "$SCRAPER_PATH" && uv run skill/scripts/scraper_cli.py start \
   --query "dentistas" --country ES --min-pop 50000 --workers 1
 ```
 
 ### Control Jobs
 ```bash
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" pause <job_id>
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" resume <job_id>
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" stop <job_id>
+cd "$SCRAPER_PATH"
+uv run skill/scripts/scraper_cli.py pause <job_id>
+uv run skill/scripts/scraper_cli.py resume <job_id>
+uv run skill/scripts/scraper_cli.py stop <job_id>
 ```
 
 ### View Results
 ```bash
+cd "$SCRAPER_PATH"
+
 # List all result files
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" results --list
+uv run skill/scripts/scraper_cli.py results --list
 
 # Show last 20 records from a job
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" results <job_id> --show 20
+uv run skill/scripts/scraper_cli.py results <job_id> --show 20
 
 # Get detailed summary
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" results <job_id> --summary
+uv run skill/scripts/scraper_cli.py results <job_id> --summary
 
 # Get file path only (for scripting)
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" results <job_id> --path
+uv run skill/scripts/scraper_cli.py results <job_id> --path
 
 # Export as JSON
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" results <job_id> --show 50 --format json
+uv run skill/scripts/scraper_cli.py results <job_id> --show 50 --format json
 
 # Show file locations
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" files
+uv run skill/scripts/scraper_cli.py files
 ```
 
 ## Resource Management Principles
@@ -129,7 +212,14 @@ python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" files
 Before any scraping, Google Maps cookies must be obtained:
 
 ```bash
-python "$SCRAPER_PATH/scrape_maps_interactive.py" --setup
+# Using uv (recommended)
+cd "$SCRAPER_PATH" && uv run scrape_maps_interactive.py --setup
+
+# Or using .venv directly (Linux/macOS)
+"$SCRAPER_PATH/.venv/bin/python" "$SCRAPER_PATH/scrape_maps_interactive.py" --setup
+
+# Windows PowerShell
+& "$env:SCRAPER_PATH\.venv\Scripts\python.exe" "$env:SCRAPER_PATH\scrape_maps_interactive.py" --setup
 ```
 
 This opens a visible browser. User must:
@@ -143,7 +233,7 @@ This opens a visible browser. User must:
 
 **Conservative approach (recommended for most users):**
 ```bash
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" start \
+cd "$SCRAPER_PATH" && uv run skill/scripts/scraper_cli.py start \
   --query "clinicas dentales" \
   --country ES \
   --min-pop 100000 \
@@ -153,7 +243,7 @@ python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" start \
 
 **With custom output directory:**
 ```bash
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" start \
+cd "$SCRAPER_PATH" && uv run skill/scripts/scraper_cli.py start \
   --query "clinicas dentales" \
   --country ES \
   --output-dir /path/to/results
@@ -175,7 +265,7 @@ python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" start \
 
 **Quick status check (use this most often):**
 ```bash
-python "$SCRAPER_PATH/skill/scripts/scraper_status.py"
+cd "$SCRAPER_PATH" && uv run skill/scripts/scraper_status.py
 ```
 
 Output shows:
@@ -185,23 +275,25 @@ Output shows:
 
 **Interactive TUI manager (advanced):**
 ```bash
-python "$SCRAPER_PATH/scrape_manager.py"
+cd "$SCRAPER_PATH" && uv run scrape_manager.py
 ```
 
 ### 4. Controlling Jobs
 
 ```bash
+cd "$SCRAPER_PATH"
+
 # Pause - saves checkpoint, frees system resources
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" pause <job_id>
+uv run skill/scripts/scraper_cli.py pause <job_id>
 
 # Resume - continues from last checkpoint
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" resume <job_id>
+uv run skill/scripts/scraper_cli.py resume <job_id>
 
 # Stop gracefully - finishes current batch, then stops
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" stop <job_id>
+uv run skill/scripts/scraper_cli.py stop <job_id>
 
 # Force kill - immediate stop (may lose current city progress)
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" kill <pid>
+uv run skill/scripts/scraper_cli.py kill <pid>
 ```
 
 ### 5. Accessing Results
@@ -209,26 +301,28 @@ python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" kill <pid>
 Results are saved incrementally to CSV files.
 
 ```bash
+cd "$SCRAPER_PATH"
+
 # List all result files with record counts
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" results --list
+uv run skill/scripts/scraper_cli.py results --list
 
 # Get detailed summary of a job (files, stats, paths)
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" results <job_id> --summary
+uv run skill/scripts/scraper_cli.py results <job_id> --summary
 
 # Show last N records in table format
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" results <job_id> --show 20
+uv run skill/scripts/scraper_cli.py results <job_id> --show 20
 
 # Show records in JSON format (for processing)
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" results <job_id> --show 50 --format json
+uv run skill/scripts/scraper_cli.py results <job_id> --show 50 --format json
 
 # Show records in TSV format (for spreadsheets)
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" results <job_id> --show 100 --format tsv
+uv run skill/scripts/scraper_cli.py results <job_id> --show 100 --format tsv
 
 # Get only the file path (for scripting)
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" results <job_id> --path
+uv run skill/scripts/scraper_cli.py results <job_id> --path
 
 # Show all file locations and directory info
-python "$SCRAPER_PATH/skill/scripts/scraper_cli.py" files
+uv run skill/scripts/scraper_cli.py files
 ```
 
 ## Output Files
@@ -276,7 +370,8 @@ Priority order for output directory:
 export SCRAPER_OUTPUT_DIR="/home/user/leads/gmaps"
 
 # Or per-job
-python scraper_cli.py start --query "dentistas" --country ES --output-dir /tmp/test
+cd "$SCRAPER_PATH" && uv run skill/scripts/scraper_cli.py start \
+  --query "dentistas" --country ES --output-dir /tmp/test
 ```
 
 ## Conversation Patterns
