@@ -532,3 +532,242 @@ Al hacer `--resume`, las stats se sincronizan automaticamente con el contenido r
 - **Interrupcion segura**: Puedes parar el proceso con `Ctrl+C`, `kill`, o desde el gestor con `S`. El proceso para despues del batch actual (cada 10 negocios), guarda checkpoint y puedes retomar con `--resume --run-id {id}`.
 - **Gestor de instancias**: Usa `scrape_manager.py` para controlar instancias en ejecucion sin interrumpir el scraping.
 - **GeoNames API**: Necesitas una cuenta gratuita en [geonames.org](https://www.geonames.org/login) para usar la API. El usuario por defecto es `gorkota`.
+
+## Skill para Claude Code / AI Assistants
+
+Este repositorio incluye un **skill** que permite a asistentes de IA (Claude Code, Codex, etc.) controlar el scraper de forma conversacional. El usuario puede decir cosas como:
+
+- "¿Como va el scraping?"
+- "Busca clinicas dentales en Francia"
+- "Pausa el scraping y muestrame los resultados"
+
+### Estructura del Skill
+
+```
+skill/
+├── SKILL.md                # Definicion del skill (instrucciones para el AI)
+└── scripts/
+    ├── scraper_status.py   # Status rapido (ligero, para uso frecuente)
+    └── scraper_cli.py      # CLI completo (start/pause/resume/stop/results)
+```
+
+### Instalacion del Skill
+
+#### Opcion 1: Instalacion local (recomendada)
+
+Esta opcion mantiene el skill junto al scraper, facilitando actualizaciones.
+
+```bash
+# 1. Clonar el repositorio en una ubicacion permanente
+git clone https://github.com/gorkavidal/scrapping.git ~/tools/scrapping
+cd ~/tools/scrapping
+
+# 2. Instalar dependencias
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m playwright install chromium
+
+# 3. Configurar variable de entorno (añadir a ~/.bashrc o ~/.zshrc)
+echo 'export SCRAPER_PATH="$HOME/tools/scrapping"' >> ~/.zshrc
+source ~/.zshrc
+
+# 4. Crear enlace simbolico al skill en el directorio de skills
+mkdir -p ~/.agents/skills
+ln -s ~/tools/scrapping/skill ~/.agents/skills/gmaps-scraper
+
+# 5. (Opcional) Registrar en .skill-lock.json para que Claude Code lo reconozca
+```
+
+#### Opcion 2: Instalacion standalone del skill
+
+Si quieres instalar solo el skill sin clonar todo el repo:
+
+```bash
+# Crear directorio de skills si no existe
+mkdir -p ~/.agents/skills/gmaps-scraper/scripts
+
+# Descargar archivos del skill
+curl -o ~/.agents/skills/gmaps-scraper/SKILL.md \
+  https://raw.githubusercontent.com/gorkavidal/scrapping/main/skill/SKILL.md
+curl -o ~/.agents/skills/gmaps-scraper/scripts/scraper_status.py \
+  https://raw.githubusercontent.com/gorkavidal/scrapping/main/skill/scripts/scraper_status.py
+curl -o ~/.agents/skills/gmaps-scraper/scripts/scraper_cli.py \
+  https://raw.githubusercontent.com/gorkavidal/scrapping/main/skill/scripts/scraper_cli.py
+
+# Hacer ejecutables
+chmod +x ~/.agents/skills/gmaps-scraper/scripts/*.py
+```
+
+**Nota**: Esta opcion requiere que el scraper este instalado por separado y que `SCRAPER_PATH` apunte a el.
+
+#### Opcion 3: Instalacion en otros ordenadores
+
+Para instalar en un nuevo ordenador:
+
+```bash
+# === PASO 1: Instalar el scraper ===
+# Elegir ubicacion (recomendado: ~/tools o /opt para uso compartido)
+INSTALL_DIR="$HOME/tools/scrapping"
+git clone https://github.com/gorkavidal/scrapping.git "$INSTALL_DIR"
+cd "$INSTALL_DIR"
+
+# Crear entorno virtual
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m playwright install chromium
+
+# === PASO 2: Configurar variable de entorno ===
+# Añadir a tu shell config (~/.bashrc, ~/.zshrc, etc.)
+echo "export SCRAPER_PATH=\"$INSTALL_DIR\"" >> ~/.zshrc
+echo "alias scraper-status='python3 \$SCRAPER_PATH/skill/scripts/scraper_status.py'" >> ~/.zshrc
+echo "alias scraper='python3 \$SCRAPER_PATH/skill/scripts/scraper_cli.py'" >> ~/.zshrc
+source ~/.zshrc
+
+# === PASO 3: Instalar skill para Claude Code ===
+mkdir -p ~/.agents/skills
+ln -s "$INSTALL_DIR/skill" ~/.agents/skills/gmaps-scraper
+
+# === PASO 4: Verificar instalacion ===
+scraper-status
+```
+
+### Permisos y Directorios
+
+El scraper necesita permisos de escritura en varios directorios:
+
+| Directorio | Proposito | Permisos |
+|------------|-----------|----------|
+| `$SCRAPER_PATH/scrappings/` | CSVs de resultados | Escritura |
+| `$SCRAPER_PATH/cache/` | Checkpoints, jobs, control | Escritura |
+| `$SCRAPER_PATH/browser_data/` | Cookies de Google Maps | Escritura |
+| `$SCRAPER_PATH/*.log` | Logs de ejecucion | Escritura |
+
+Si instalas en `/opt` o ubicacion compartida, asegurate de que el usuario tenga permisos:
+
+```bash
+# Para instalacion en /opt (uso compartido)
+sudo mkdir -p /opt/scrapping
+sudo chown -R $USER:$USER /opt/scrapping
+git clone https://github.com/gorkavidal/scrapping.git /opt/scrapping
+```
+
+### Gestion de Archivos de Salida
+
+Los resultados se acumulan en `scrappings/`. Para gestionar el espacio:
+
+```bash
+# Ver espacio usado
+du -sh $SCRAPER_PATH/scrappings/
+
+# Listar archivos por tamaño
+ls -lhS $SCRAPER_PATH/scrappings/
+
+# Archivar resultados antiguos (mas de 30 dias)
+mkdir -p $SCRAPER_PATH/scrappings/archive
+find $SCRAPER_PATH/scrappings -name "*.csv" -mtime +30 -exec mv {} $SCRAPER_PATH/scrappings/archive/ \;
+
+# Comprimir archivo
+tar -czvf $SCRAPER_PATH/scrappings/archive_$(date +%Y%m).tar.gz $SCRAPER_PATH/scrappings/archive/
+rm -rf $SCRAPER_PATH/scrappings/archive/
+```
+
+### Uso del Skill
+
+Una vez instalado, el AI assistant puede usar estos comandos:
+
+#### Status rapido (uso frecuente)
+```bash
+python3 $SCRAPER_PATH/skill/scripts/scraper_status.py
+```
+
+Salida ejemplo:
+```
+============================================================
+GOOGLE MAPS SCRAPER STATUS
+============================================================
+
+Cookies: ✓ Cookies valid (3 days old)
+
+--- Active Jobs (1) ---
+
+  [RUNNING] dentistas in ES
+    PID: 12345 | Workers: 2
+    Progress: 45/120 cities (37.5%)
+    Results: 1523 with email (892 corporate)
+    Runtime: 2h 15m | ETA: 3h 45m
+    Current: Valencia
+
+--- Recent History (5 total) ---
+  ● restaurantes (ES) - 3450 emails - completed
+  ○ hoteles (FR) - 890 emails - interrupted [resumable]
+```
+
+#### Iniciar nuevo scraping
+```bash
+python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py start \
+  --query "clinicas dentales" \
+  --country ES \
+  --min-pop 50000 \
+  --workers 1
+```
+
+#### Controlar jobs
+```bash
+# Pausar (libera recursos, guarda checkpoint)
+python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py pause <job_id>
+
+# Reanudar
+python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py resume <job_id>
+
+# Parar gracefully
+python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py stop <job_id>
+```
+
+#### Acceder a resultados
+```bash
+# Listar archivos de resultados
+python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py results --list
+
+# Resumen de un job
+python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py results <job_id> --summary
+
+# Obtener ruta del CSV
+python3 $SCRAPER_PATH/skill/scripts/scraper_cli.py results <job_id> --path
+```
+
+### Principios de Uso de Recursos
+
+El skill esta diseñado para ser **conservador con los recursos**:
+
+| RAM del Sistema | Workers Recomendados | Jobs Simultaneos |
+|-----------------|---------------------|------------------|
+| 8GB             | 1                   | 1                |
+| 16GB            | 1-2                 | 1                |
+| 32GB+           | 2-3                 | 1-2              |
+
+**Reglas para el AI assistant**:
+- Por defecto, usar 1 worker
+- Nunca sugerir mas de 3 workers sin que el usuario lo pida explicitamente
+- Recomendar pausar si el sistema esta bajo carga
+- Los resultados se guardan cada 10 negocios, es seguro interrumpir
+
+### Actualizacion del Skill
+
+```bash
+cd $SCRAPER_PATH
+git pull origin main
+```
+
+Si usaste enlace simbolico, el skill se actualiza automaticamente. Si copiaste los archivos manualmente, repite el proceso de copia.
+
+### Troubleshooting del Skill
+
+| Problema | Solucion |
+|----------|----------|
+| "SCRAPER_PATH not set" | Añadir `export SCRAPER_PATH=...` a tu shell config |
+| "No module named 'job_manager'" | Verificar que SCRAPER_PATH apunta al directorio correcto |
+| "Permission denied" | Verificar permisos de escritura en los directorios |
+| "Cookies expired" | Ejecutar `python scrape_maps_interactive.py --setup` |
+| Skill no aparece en Claude Code | Verificar que existe `~/.agents/skills/gmaps-scraper/SKILL.md` |
