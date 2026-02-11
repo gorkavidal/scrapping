@@ -2299,11 +2299,11 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
         # --- Modo --cookies-only: solo verificar/refrescar cookies ---
         if args.cookies_only:
             print("\n" + "=" * 60)
-            print("MODO COOKIES - Verificación de Google Maps")
+            print("MODO COOKIES - Verificacion de Google Maps")
             print("=" * 60)
-            print("\nSe abrirá un navegador con Google Maps.")
-            print("1. Acepta las cookies si aparece el diálogo")
-            print("2. Completa cualquier CAPTCHA o verificación")
+            print("\nSe abrira un navegador con Google Maps.")
+            print("1. Acepta las cookies si aparece el dialogo")
+            print("2. Completa cualquier CAPTCHA o verificacion")
             print("3. Verifica que ves resultados en el mapa")
             print("4. Cierra el navegador cuando termines")
             print("\n" + "-" * 60)
@@ -2312,39 +2312,49 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                 from playwright.async_api import async_playwright
                 async with async_playwright() as p:
                     browser = await p.chromium.launch(headless=False)
-                    context = await browser.new_context(
-                        viewport={'width': 1280, 'height': 900},
-                        locale='es-ES',
-                        timezone_id='Europe/Madrid',
-                    )
-                    # Cargar cookies existentes si hay
+
+                    # Crear contexto (con cookies existentes si las hay)
+                    context_options = {
+                        'viewport': {'width': 1280, 'height': 900},
+                        'locale': 'es-ES',
+                        'timezone_id': 'Europe/Madrid',
+                    }
                     if os.path.exists(storage_state_path):
                         try:
-                            await context.storage_state(path=storage_state_path)
-                            context = await browser.new_context(
-                                storage_state=storage_state_path,
-                                viewport={'width': 1280, 'height': 900},
-                                locale='es-ES',
-                                timezone_id='Europe/Madrid',
-                            )
-                            print("Cookies anteriores cargadas.")
+                            context_options['storage_state'] = storage_state_path
+                            print("Cargando cookies anteriores...")
                         except Exception:
                             pass
 
+                    context = await browser.new_context(**context_options)
                     page = await context.new_page()
-                    # Navegar a Google Maps con una búsqueda genérica
-                    await page.goto("https://www.google.com/maps/search/restaurantes", wait_until='domcontentloaded')
-                    print("\nNavegador abierto. Completa la verificación y cierra cuando termines...")
 
-                    # Esperar a que el usuario cierre el navegador
+                    # Navegar a Google Maps con una busqueda generica
+                    print("\nAbriendo Google Maps...")
+                    await page.goto("https://www.google.com/maps/search/restaurantes", wait_until='domcontentloaded')
+                    print("Navegador abierto. Completa la verificacion y cierra cuando termines...")
+
+                    # Esperar a que el usuario cierre la pagina o el navegador
                     try:
-                        await page.wait_for_event('close', timeout=0)
+                        # Esperar indefinidamente hasta que se cierre
+                        while True:
+                            try:
+                                await page.wait_for_timeout(1000)
+                                # Verificar si la pagina sigue abierta
+                                if page.is_closed():
+                                    break
+                            except Exception:
+                                break
                     except Exception:
                         pass
 
-                    # Guardar cookies
-                    await context.storage_state(path=storage_state_path)
-                    print(f"\n✓ Cookies guardadas en: {storage_state_path}")
+                    # Guardar cookies antes de cerrar
+                    try:
+                        await context.storage_state(path=storage_state_path)
+                        print(f"\nCookies guardadas en: {storage_state_path}")
+                    except Exception as e:
+                        print(f"\nError guardando cookies: {e}")
+
                     await browser.close()
 
             asyncio.run(cookies_only_flow())
