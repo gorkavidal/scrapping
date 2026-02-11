@@ -16,6 +16,7 @@ Optimizaciones v2:
 
 import os
 import json
+import platform
 import threading
 import time
 import tempfile
@@ -24,6 +25,9 @@ from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
+
+# Windows compatibility
+IS_WINDOWS = platform.system() == 'Windows'
 
 
 class JobStatus(str, Enum):
@@ -532,12 +536,37 @@ class JobManager:
         return instances
 
     def is_instance_alive(self, pid: int) -> bool:
-        """Verifica si un proceso sigue vivo."""
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
+        """Verifica si un proceso sigue vivo.
+
+        En Windows, os.kill(pid, 0) no funciona igual que en Unix.
+        Usamos ctypes para verificar el proceso en Windows.
+        """
+        if IS_WINDOWS:
+            # En Windows, usar OpenProcess para verificar si el proceso existe
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle == 0:
+                return False
+
+            # Verificar si el proceso sigue activo
+            exit_code = ctypes.c_ulong()
+            result = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            kernel32.CloseHandle(handle)
+
+            if result == 0:
+                return False
+            return exit_code.value == STILL_ACTIVE
+        else:
+            # Unix: os.kill con señal 0 verifica si el proceso existe
+            try:
+                os.kill(pid, 0)
+                return True
+            except OSError:
+                return False
 
     def cleanup_dead_instances(self) -> List[int]:
         """Limpia instancias muertas y marca sus jobs como interrupted.
