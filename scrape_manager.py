@@ -14,6 +14,7 @@ Funcionalidades:
 import curses
 import json
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -25,6 +26,31 @@ import aiohttp
 from datetime import datetime
 from typing import List, Optional
 from collections import deque
+
+# ---- Windows compatibility: Use ASCII characters instead of Unicode ----
+IS_WINDOWS = platform.system() == 'Windows'
+
+# Character mappings for Windows compatibility
+if IS_WINDOWS:
+    CHAR_SEARCH = '[?]'      # Instead of 🔍
+    CHAR_CLIPBOARD = '[#]'   # Instead of 📋
+    CHAR_CORNER = '`-'       # Instead of └─
+    CHAR_BAR_FULL = '#'      # Instead of █ or ▓
+    CHAR_BAR_EMPTY = '-'     # Instead of ░
+    CHAR_CHECK = '[v]'       # Instead of ✓
+    CHAR_CROSS = '[x]'       # Instead of ✗
+    CHAR_ARROW = '>'         # Instead of →
+    CHAR_LINE = '-'          # Instead of ─
+else:
+    CHAR_SEARCH = '🔍'
+    CHAR_CLIPBOARD = '📋'
+    CHAR_CORNER = '└─'
+    CHAR_BAR_FULL = '█'
+    CHAR_BAR_EMPTY = '░'
+    CHAR_CHECK = '✓'
+    CHAR_CROSS = '✗'
+    CHAR_ARROW = '→'
+    CHAR_LINE = '─'
 
 from job_manager import (
     JobManager, Job, Instance, JobStatus, JobStats,
@@ -412,7 +438,7 @@ class ScrapeManager:
                 if status == 'searching':
                     # Animación de búsqueda inicial
                     search_dots = "." * ((int(time.time()) % 3) + 1)
-                    search_line = f"      └─ 🔍 Conectando a Maps{search_dots}"
+                    search_line = f"      {CHAR_CORNER} {CHAR_SEARCH} Conectando a Maps{search_dots}"
                     self.stdscr.attron(curses.color_pair(4))  # Cyan
                     self.stdscr.addstr(y, 4, search_line[:width - 6])
                     self.stdscr.attroff(curses.color_pair(4))
@@ -421,7 +447,7 @@ class ScrapeManager:
                     # Scroll en progreso - mostrar resultados encontrados
                     scroll_results = city_data.get('scroll_results', 0)
                     search_dots = "." * ((int(time.time()) % 3) + 1)
-                    search_line = f"      └─ 🔍 Scroll en Maps{search_dots} ({scroll_results} encontrados)"
+                    search_line = f"      {CHAR_CORNER} {CHAR_SEARCH} Scroll en Maps{search_dots} ({scroll_results} encontrados)"
                     self.stdscr.attron(curses.color_pair(4))  # Cyan
                     self.stdscr.addstr(y, 4, search_line[:width - 6])
                     self.stdscr.attroff(curses.color_pair(4))
@@ -432,7 +458,7 @@ class ScrapeManager:
                     cards_opened = city_data.get('cards_opened', 0)
                     scroll_results = city_data.get('scroll_results', 0)
                     search_dots = "." * ((int(time.time()) % 3) + 1)
-                    search_line = f"      └─ 📋 Abriendo fichas{search_dots} {cards_opened}/{cards_total} (de {scroll_results} total)"
+                    search_line = f"      {CHAR_CORNER} {CHAR_CLIPBOARD} Abriendo fichas{search_dots} {cards_opened}/{cards_total} (de {scroll_results} total)"
                     self.stdscr.attron(curses.color_pair(6))  # Magenta
                     self.stdscr.addstr(y, 4, search_line[:width - 6])
                     self.stdscr.attroff(curses.color_pair(6))
@@ -442,8 +468,8 @@ class ScrapeManager:
                     biz_pct = (biz_processed / biz_total * 100) if biz_total > 0 else 0
                     mini_bar_width = 20
                     mini_filled = int(mini_bar_width * biz_pct / 100)
-                    mini_bar = "▓" * mini_filled + "░" * (mini_bar_width - mini_filled)
-                    biz_line = f"      └─ [{mini_bar}] {biz_processed}/{biz_total} ({biz_pct:.0f}%)"
+                    mini_bar = CHAR_BAR_FULL * mini_filled + CHAR_BAR_EMPTY * (mini_bar_width - mini_filled)
+                    biz_line = f"      {CHAR_CORNER} [{mini_bar}] {biz_processed}/{biz_total} ({biz_pct:.0f}%)"
                     self.stdscr.attron(curses.color_pair(2))  # Amarillo
                     self.stdscr.addstr(y, 4, biz_line[:width - 6])
                     self.stdscr.attroff(curses.color_pair(2))
@@ -465,8 +491,8 @@ class ScrapeManager:
                 biz_pct = (biz_processed / biz_total * 100) if biz_total > 0 else 0
                 mini_bar_width = 20
                 mini_filled = int(mini_bar_width * biz_pct / 100)
-                mini_bar = "▓" * mini_filled + "░" * (mini_bar_width - mini_filled)
-                biz_line = f"  └─ Negocios: [{mini_bar}] {biz_processed}/{biz_total} ({biz_pct:.0f}%)"
+                mini_bar = CHAR_BAR_FULL * mini_filled + CHAR_BAR_EMPTY * (mini_bar_width - mini_filled)
+                biz_line = f"  {CHAR_CORNER} Negocios: [{mini_bar}] {biz_processed}/{biz_total} ({biz_pct:.0f}%)"
                 self.stdscr.attron(curses.color_pair(2))  # Amarillo
                 self.stdscr.addstr(y, 4, biz_line[:width - 6])
                 self.stdscr.attroff(curses.color_pair(2))
@@ -474,7 +500,7 @@ class ScrapeManager:
             else:
                 # Todavía buscando en Maps
                 search_dots = "." * ((int(time.time()) % 3) + 1)
-                search_line = f"  └─ 🔍 Buscando en Maps{search_dots}"
+                search_line = f"  {CHAR_CORNER} {CHAR_SEARCH} Buscando en Maps{search_dots}"
                 self.stdscr.attron(curses.color_pair(4))  # Cyan
                 self.stdscr.addstr(y, 4, search_line[:width - 6])
                 self.stdscr.attroff(curses.color_pair(4))
@@ -483,7 +509,7 @@ class ScrapeManager:
         # Progress bar
         bar_width = min(40, width - 20)
         filled = int(bar_width * progress_pct / 100)
-        bar = "█" * filled + "░" * (bar_width - filled)
+        bar = CHAR_BAR_FULL * filled + CHAR_BAR_EMPTY * (bar_width - filled)
         progress_line = f"Progreso: [{bar}] {progress_pct:.1f}%"
         self.stdscr.addstr(y, 4, progress_line[:width - 6])
         y += 1
@@ -714,11 +740,11 @@ class ScrapeManager:
         y += 1
         if job.checkpoint_file and os.path.exists(job.checkpoint_file):
             self.stdscr.attron(curses.color_pair(1))
-            self.stdscr.addstr(y, 4, "✓ Checkpoint disponible (puede retomarse)")
+            self.stdscr.addstr(y, 4, f"{CHAR_CHECK} Checkpoint disponible (puede retomarse)")
             self.stdscr.attroff(curses.color_pair(1))
         else:
             self.stdscr.attron(curses.A_DIM)
-            self.stdscr.addstr(y, 4, "✗ Sin checkpoint")
+            self.stdscr.addstr(y, 4, f"{CHAR_CROSS} Sin checkpoint")
             self.stdscr.attroff(curses.A_DIM)
 
     def draw_files_view(self):
@@ -1427,7 +1453,7 @@ class ScrapeManager:
 
             for i, item in enumerate(visible_items):
                 actual_index = scroll_offset + i
-                prefix = "→ " if actual_index == selected else "  "
+                prefix = f"{CHAR_ARROW} " if actual_index == selected else "  "
 
                 if actual_index == selected:
                     self.stdscr.attron(curses.A_REVERSE)
@@ -1455,7 +1481,7 @@ class ScrapeManager:
 
             # Footer
             footer_y = height - 3
-            self.stdscr.addstr(footer_y, 2, "─" * (width - 4))
+            self.stdscr.addstr(footer_y, 2, CHAR_LINE * (width - 4))
             self.stdscr.attron(curses.A_DIM)
             back_hint = "  [B] Volver" if allow_back else ""
             self.stdscr.addstr(footer_y + 1, 2, f"[↑/↓] Navegar  [Enter] Seleccionar  [Esc] Omitir{back_hint}")
@@ -1622,7 +1648,7 @@ class ScrapeManager:
 
                     # Draw fields
                     for i, (key, label, _) in enumerate(fields):
-                        prefix = "→ " if i == current_field else "  "
+                        prefix = f"{CHAR_ARROW} " if i == current_field else "  "
                         if i == current_field:
                             self.stdscr.attron(curses.A_BOLD)
 
@@ -1634,7 +1660,7 @@ class ScrapeManager:
 
                     # Instructions
                     y += len(fields) + 2
-                    self.stdscr.addstr(y, 2, "─" * (width - 4))
+                    self.stdscr.addstr(y, 2, CHAR_LINE * (width - 4))
                     y += 1
                     self.stdscr.attron(curses.A_DIM)
                     self.stdscr.addstr(y, 2, "[Tab/↓] Siguiente  [↑] Anterior  [Enter] Editar campo  [Esc] Cancelar")

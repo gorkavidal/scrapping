@@ -4,9 +4,10 @@ Scraper de Google Maps que extrae negocios (nombre, telefono, direccion, rating,
 
 ## Requisitos
 
-- Python 3.11+ (recomendado 3.13)
+- Python 3.11 o 3.12 (recomendado). En Windows, Python 3.13+ puede requerir compiladores adicionales.
 - [uv](https://github.com/astral-sh/uv) (recomendado) o pip
 - Google Chrome/Chromium (lo instala Playwright automaticamente)
+- **Windows solamente**: `windows-curses` para la interfaz de gestion (se instala automaticamente con los comandos de abajo)
 
 ## Instalacion
 
@@ -55,6 +56,10 @@ uv pip install -r requirements.txt
 
 ### Windows
 
+**Requisitos previos:**
+- Python 3.11 o 3.12 (recomendado). Python 3.13+ puede requerir Visual C++ Build Tools para compilar algunas dependencias.
+- Git: `winget install Git.Git` o descargarlo de https://git-scm.com/download/win
+
 ```powershell
 # Instalar uv (PowerShell como Administrador)
 irm https://astral.sh/uv/install.ps1 | iex
@@ -65,14 +70,22 @@ cd scrapping
 
 # Crear entorno virtual e instalar dependencias
 uv venv
-.venv\Scripts\activate
 uv pip install -r requirements.txt
 
+# Instalar curses para Windows (necesario para scrape_manager.py)
+uv pip install windows-curses
+
 # Instalar navegador Chromium para Playwright
-python -m playwright install chromium
+uv run python -m playwright install chromium
 ```
 
-> En Windows, los comandos se ejecutan con `.venv\Scripts\python` en lugar de `.venv/bin/python`. El flag `--continue-run` lanza el proceso en background, pero si cierras la terminal de Windows el proceso muere. Para ejecucion prolongada en Windows usa `start /B` o ejecutalo dentro de una sesion de `tmux` en WSL.
+**Notas importantes para Windows:**
+
+- Los comandos se ejecutan con `.venv\Scripts\python` o `uv run python` en lugar de `.venv/bin/python`.
+- Si `uv run playwright install chromium` falla con "program not found", usa `uv run python -m playwright install chromium`.
+- El paquete `windows-curses` es necesario para ejecutar `scrape_manager.py` (la interfaz de gestion).
+- Si cierras la terminal, el proceso de scraping muere. Para ejecucion prolongada usa `start /B` o ejecutalo en WSL.
+- Python 3.13+ puede requerir instalar "Microsoft C++ Build Tools" si hay errores de compilacion (greenlet, etc.). Python 3.12 evita este problema.
 
 ### Docker / Dev Container
 
