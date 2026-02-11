@@ -2265,6 +2265,8 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                             help='Configuración interactiva completa + verificación de Google Maps en navegador visible. Guarda todo para --continue.')
         parser.add_argument('--reset-cookies', action='store_true', dest='reset_cookies',
                             help='Elimina las cookies guardadas de Google Maps para reiniciar la sesión.')
+        parser.add_argument('--cookies-only', action='store_true', dest='cookies_only',
+                            help='Solo abre el navegador para verificar/refrescar cookies de Google Maps. No pide configuración.')
         parser.add_argument('--continue-run', action='store_true', dest='continue_run',
                             help='Relanza el scraping en segundo plano usando la configuración guardada por --setup.')
         parser.add_argument('--run-id', type=str, dest='run_id',
@@ -2292,6 +2294,60 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
                 print(f"\nEjecuta --setup para configurar una nueva sesión.")
             else:
                 print("\nNo había cookies guardadas para eliminar.")
+            return
+
+        # --- Modo --cookies-only: solo verificar/refrescar cookies ---
+        if args.cookies_only:
+            print("\n" + "=" * 60)
+            print("MODO COOKIES - Verificación de Google Maps")
+            print("=" * 60)
+            print("\nSe abrirá un navegador con Google Maps.")
+            print("1. Acepta las cookies si aparece el diálogo")
+            print("2. Completa cualquier CAPTCHA o verificación")
+            print("3. Verifica que ves resultados en el mapa")
+            print("4. Cierra el navegador cuando termines")
+            print("\n" + "-" * 60)
+
+            async def cookies_only_flow():
+                from playwright.async_api import async_playwright
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=False)
+                    context = await browser.new_context(
+                        viewport={'width': 1280, 'height': 900},
+                        locale='es-ES',
+                        timezone_id='Europe/Madrid',
+                    )
+                    # Cargar cookies existentes si hay
+                    if os.path.exists(storage_state_path):
+                        try:
+                            await context.storage_state(path=storage_state_path)
+                            context = await browser.new_context(
+                                storage_state=storage_state_path,
+                                viewport={'width': 1280, 'height': 900},
+                                locale='es-ES',
+                                timezone_id='Europe/Madrid',
+                            )
+                            print("Cookies anteriores cargadas.")
+                        except Exception:
+                            pass
+
+                    page = await context.new_page()
+                    # Navegar a Google Maps con una búsqueda genérica
+                    await page.goto("https://www.google.com/maps/search/restaurantes", wait_until='domcontentloaded')
+                    print("\nNavegador abierto. Completa la verificación y cierra cuando termines...")
+
+                    # Esperar a que el usuario cierre el navegador
+                    try:
+                        await page.wait_for_event('close', timeout=0)
+                    except Exception:
+                        pass
+
+                    # Guardar cookies
+                    await context.storage_state(path=storage_state_path)
+                    print(f"\n✓ Cookies guardadas en: {storage_state_path}")
+                    await browser.close()
+
+            asyncio.run(cookies_only_flow())
             return
 
         # --- Modo --continue: relanzar con config guardada ---

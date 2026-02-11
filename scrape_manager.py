@@ -1357,8 +1357,35 @@ class ScrapeManager:
         self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
 
     def refresh_cookies(self):
-        """Shortcut to refresh Google Maps cookies via --setup mode."""
-        self.run_setup_mode()
+        """Shortcut to refresh Google Maps cookies via --cookies-only mode."""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_path = os.path.join(script_dir, "scrape_maps_interactive.py")
+
+        # Temporarily exit curses
+        curses.endwin()
+
+        print("\n" + "=" * 60)
+        print("REFRESCAR COOKIES DE GOOGLE MAPS")
+        print("=" * 60)
+        print("\nSe abrira un navegador. Completa la verificacion y cierralo.")
+
+        try:
+            subprocess.run([sys.executable, script_path, '--cookies-only'], check=False)
+        except KeyboardInterrupt:
+            pass
+
+        print("\nVolviendo al gestor...")
+        time.sleep(1)
+
+        # Reinitialize curses
+        self.stdscr = curses.initscr()
+        curses.noecho()
+        curses.cbreak()
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        self.stdscr.keypad(True)
+        self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
         self.show_message("Cookies actualizadas", 3.0)
 
     def new_scraping_wizard(self):
