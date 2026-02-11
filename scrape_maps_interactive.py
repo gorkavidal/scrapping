@@ -2357,7 +2357,7 @@ async def main(stdscr): # Keep stdscr for potential dashboard use
 
                     await browser.close()
 
-            asyncio.run(cookies_only_flow())
+            await cookies_only_flow()
             return
 
         # --- Modo --continue: relanzar con config guardada ---
