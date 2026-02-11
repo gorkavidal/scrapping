@@ -41,6 +41,8 @@ if IS_WINDOWS:
     CHAR_CROSS = '[x]'       # Instead of ✗
     CHAR_ARROW = '>'         # Instead of →
     CHAR_LINE = '-'          # Instead of ─
+    CHAR_UP = '^'            # Instead of ↑
+    CHAR_DOWN = 'v'          # Instead of ↓
 else:
     CHAR_SEARCH = '🔍'
     CHAR_CLIPBOARD = '📋'
@@ -51,6 +53,8 @@ else:
     CHAR_CROSS = '✗'
     CHAR_ARROW = '→'
     CHAR_LINE = '─'
+    CHAR_UP = '↑'
+    CHAR_DOWN = '↓'
 
 from job_manager import (
     JobManager, Job, Instance, JobStatus, JobStats,
@@ -268,7 +272,7 @@ class ScrapeManager:
             help_text = " [N]uevo [Enter]Revivir [C]lonar [D]eliminar [F]iles [1]Act [2]Hist [Q]uit "
         else:  # files
             email_mode = "Todos" if self.show_all_emails else "Corp"
-            help_text = f" [↑↓]Scroll [E]mails:{email_mode} [N]uevo [1]Act [2]Hist [Q]uit "
+            help_text = f" [{CHAR_UP}{CHAR_DOWN}]Scroll [E]mails:{email_mode} [N]uevo [1]Act [2]Hist [Q]uit "
 
         help_text = help_text.ljust(width - 1)[:width - 1]
 
@@ -1086,7 +1090,7 @@ class ScrapeManager:
                     self.stdscr.addstr(height - 4, 2, " " * (width - 4))
                     self.stdscr.addstr(height - 3, 2, " " * (width - 4))
                     self.stdscr.attron(curses.A_BOLD)
-                    self.stdscr.addstr(height - 4, 2, "Selecciona ciudad a reiniciar (↑/↓, Enter=OK, Esc=Cancelar):")
+                    self.stdscr.addstr(height - 4, 2, f"Selecciona ciudad a reiniciar ({CHAR_UP}/{CHAR_DOWN}, Enter=OK, Esc=Cancelar):")
                     self.stdscr.attroff(curses.A_BOLD)
 
                     # Mostrar ciudades
@@ -1475,16 +1479,16 @@ class ScrapeManager:
 
             # Scroll indicators
             if scroll_offset > 0:
-                self.stdscr.addstr(y - 1, width - 10, "↑ más ↑")
+                self.stdscr.addstr(y - 1, width - 10, f"{CHAR_UP} mas {CHAR_UP}")
             if scroll_offset + max_visible < len(items):
-                self.stdscr.addstr(y + len(visible_items), width - 10, "↓ más ↓")
+                self.stdscr.addstr(y + len(visible_items), width - 10, f"{CHAR_DOWN} mas {CHAR_DOWN}")
 
             # Footer
             footer_y = height - 3
             self.stdscr.addstr(footer_y, 2, CHAR_LINE * (width - 4))
             self.stdscr.attron(curses.A_DIM)
             back_hint = "  [B] Volver" if allow_back else ""
-            self.stdscr.addstr(footer_y + 1, 2, f"[↑/↓] Navegar  [Enter] Seleccionar  [Esc] Omitir{back_hint}")
+            self.stdscr.addstr(footer_y + 1, 2, f"[{CHAR_UP}/{CHAR_DOWN}] Navegar  [Enter] Seleccionar  [Esc] Omitir{back_hint}")
             self.stdscr.attroff(curses.A_DIM)
 
             self.stdscr.refresh()
@@ -1663,7 +1667,7 @@ class ScrapeManager:
                     self.stdscr.addstr(y, 2, CHAR_LINE * (width - 4))
                     y += 1
                     self.stdscr.attron(curses.A_DIM)
-                    self.stdscr.addstr(y, 2, "[Tab/↓] Siguiente  [↑] Anterior  [Enter] Editar campo  [Esc] Cancelar")
+                    self.stdscr.addstr(y, 2, f"[Tab/{CHAR_DOWN}] Siguiente  [{CHAR_UP}] Anterior  [Enter] Editar campo  [Esc] Cancelar")
                     y += 1
                     self.stdscr.addstr(y + 1, 2, "En el último campo, [Enter] avanza al siguiente paso.")
                     self.stdscr.attroff(curses.A_DIM)
