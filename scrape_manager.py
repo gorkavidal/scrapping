@@ -267,12 +267,12 @@ class ScrapeManager:
         height, width = self.stdscr.getmaxyx()
 
         if self.view_mode == "active":
-            help_text = " [N]uevo [P]ausar [R]esumir [S]top [K]ill [W]orkers [T]Retry [F]iles [1]Act [2]Hist [Q]uit "
+            help_text = " [N]uevo [G]oogleCookies [P]ausar [R]esumir [S]top [K]ill [T]Retry [F]iles [1]Act [2]Hist [Q]uit "
         elif self.view_mode == "history":
-            help_text = " [N]uevo [Enter]Revivir [C]lonar [D]eliminar [F]iles [1]Act [2]Hist [Q]uit "
+            help_text = " [N]uevo [G]oogleCookies [Enter]Revivir [C]lonar [D]eliminar [F]iles [1]Act [2]Hist [Q]uit "
         else:  # files
             email_mode = "Todos" if self.show_all_emails else "Corp"
-            help_text = f" [{CHAR_UP}{CHAR_DOWN}]Scroll [E]mails:{email_mode} [N]uevo [1]Act [2]Hist [Q]uit "
+            help_text = f" [{CHAR_UP}{CHAR_DOWN}]Scroll [E]mails:{email_mode} [G]oogleCookies [N]uevo [1]Act [2]Hist [Q]uit "
 
         help_text = help_text.ljust(width - 1)[:width - 1]
 
@@ -883,6 +883,9 @@ class ScrapeManager:
         if key == ord('n') or key == ord('N'):
             self.new_scraping_wizard()
             return
+        if key == ord('g') or key == ord('G'):
+            self.refresh_cookies()
+            return
 
         # File view scrolling and commands
         if self.view_mode == "files":
@@ -1352,6 +1355,11 @@ class ScrapeManager:
         curses.use_default_colors()
         self.stdscr.keypad(True)
         self.stdscr.timeout(self.REFRESH_TIMEOUT_MS)
+
+    def refresh_cookies(self):
+        """Shortcut to refresh Google Maps cookies via --setup mode."""
+        self.run_setup_mode()
+        self.show_message("Cookies actualizadas", 3.0)
 
     def new_scraping_wizard(self):
         """Interactive wizard to create and launch a new scraping job."""
